@@ -1,0 +1,15 @@
+# market_signals_pipeline — Python dependencies
+# Install with:  pip install -r requirements.txt
+
+# Search — Tavily (free tier, 1,000/month)
+tavily-python>=0.3.0
+
+# HTTP — llama-server client + all free source fetchers
+# (SEC EDGAR, Google News RSS, PR Newswire, Business Wire, Wikipedia all use requests)
+requests>=2.31.0
+
+# Excel output
+openpyxl>=3.1.2
+
+# Standard library only for everything else
+# (csv, json, argparse, dataclasses, time, os, sys — no extra installs needed)
