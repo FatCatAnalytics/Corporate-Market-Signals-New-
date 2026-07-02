@@ -177,6 +177,29 @@ INTER_COMPANY_DELAY: float = 1.0
 BRAVE_API_KEY: str = os.environ.get("BRAVE_API_KEY", "BSA-YOUR_KEY_HERE")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GDELT FULL TEXT SEARCH API  (completely free, no key required)
+# Monitors 100,000+ news sources in 65 languages, updated every 15 minutes.
+# Endpoint: https://api.gdeltproject.org/api/v2/doc/doc
+# No registration. No rate limit published — use 0.5s delay to be polite.
+# Docs: https://blog.gdeltproject.org/gdelt-2-0-our-global-world-in-realtime/
+# ─────────────────────────────────────────────────────────────────────────────
+GDELT_MAX_RECORDS: int = 10      # articles per query (max 250)
+GDELT_TIMESPAN: str = "12m"      # GDELT timespan param: 15min,1h,1d,1w,1m,12m etc.
+GDELT_DELAY: float = 0.5         # polite delay between GDELT calls (seconds)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THE GUARDIAN OPEN PLATFORM  (free, 5,000 calls/day — key required)
+# Register at: https://open-platform.theguardian.com/access/
+# Covers: business, M&A, bankruptcy, corporate restructuring from Guardian content.
+# Leave as-is if you don't have a key — pipeline falls back to GDELT-only.
+# ─────────────────────────────────────────────────────────────────────────────
+GUARDIAN_API_KEY: str = os.environ.get("GUARDIAN_API_KEY", "test")
+# Note: "test" is a valid public key with lower rate limits.
+# Register for a free production key for full 5,000 calls/day access.
+GUARDIAN_MAX_RESULTS: int = 5    # articles per company query
+GUARDIAN_DELAY: float = 0.2      # polite delay (seconds)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CACHE
 # ─────────────────────────────────────────────────────────────────────────────
 # Search results are cached to avoid redundant API calls within a batch.

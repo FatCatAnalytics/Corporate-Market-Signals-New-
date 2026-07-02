@@ -15,7 +15,7 @@ Architecture
   company name  ──► │        SearchLayer.fetch()           │
                     │                                     │
                     │  1. check cache (in-memory + disk)  │
-                    │  2. Stage 1 free sources (no limits)│
+                    │  2. Stage 1 free sources (official APIs only — no scraping)│
                     │  3. Brave Search (optional, keyed)   │
                     │  4. Tavily (gated by prescreener)    │
                     │  5. sanitise + deduplicate           │
@@ -38,7 +38,8 @@ Rate limits
                 1 req/sec hard limit — handled by RateLimiter
   EDGAR       : 10 req/sec guideline — handled by RateLimiter
   Google News : no published limit — polite 0.2s delay
-  DuckDuckGo  : no API, HTML endpoint — 1 req/3s to be safe
+  GDELT       : no API key, no published limit — 0.5s polite delay
+  Guardian    : free API key, 5,000 calls/day — 0.2s polite delay
 
 Cache
 -----
@@ -140,7 +141,8 @@ _LIMITERS: dict[str, RateLimiter] = {
     "brave":        RateLimiter(1.05),   # 1 req/sec hard limit on free tier
     "edgar":        RateLimiter(0.12),   # 8 req/sec (SEC guideline is 10)
     "google_news":  RateLimiter(0.20),   # polite delay
-    "duckduckgo":   RateLimiter(3.00),   # conservative for HTML scrape
+    "gdelt":        RateLimiter(0.50),   # polite delay — no published limit
+    "guardian":     RateLimiter(0.20),   # 5,000 calls/day free — polite delay
     "prnewswire":   RateLimiter(0.50),
     "businesswire": RateLimiter(0.50),
     "wikipedia":    RateLimiter(0.10),
@@ -369,11 +371,10 @@ _HTTP.headers.update({
     "Accept":     "application/json, text/xml, */*",
 })
 
-_BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
+# Standard browser User-Agent — used by _get(use_browser_ua=True) when needed
+_BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+               "AppleWebKit/537.36 (KHTML, like Gecko) "
+               "Chrome/124.0.0.0 Safari/537.36")
 
 
 def _get(
@@ -545,46 +546,116 @@ def _source_google_news(company: str, seen: set[str], max_items: int = 12) -> tu
     return sections, urls
 
 
-# ── DuckDuckGo HTML ───────────────────────────────────────────────────────────
-def _source_duckduckgo(company: str, seen: set[str], max_items: int = 8) -> tuple[list[str], list[str]]:
-    clean = _clean_name(company)
-    query = (f'"{clean}" '
-             f'(merger OR acquisition OR bankrupt OR shutdown OR renamed OR '
-             f'"new name" OR relocated OR spinoff) 2025 OR 2026')
+# ── GDELT Full Text Search API ───────────────────────────────────────────────
+_GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 
-    r = _post(
-        "https://html.duckduckgo.com/html/",
-        "duckduckgo",
-        data    = {"q": query, "kl": "us-en"},
-        headers = {"User-Agent": _BROWSER_UA, "Accept-Language": "en-US,en;q=0.9"},
+
+def _source_gdelt(company: str, seen: set[str], max_items: int = 10) -> tuple[list[str], list[str]]:
+    """
+    GDELT 2.0 Full Text Search API.
+    No API key required. No hard rate limit — use polite delay.
+    Monitors 100,000+ news sources in 65 languages, updated every 15 minutes.
+    Returns structured JSON — no HTML parsing, no scraping.
+    Docs: https://blog.gdeltproject.org/gdelt-2-0-our-global-world-in-realtime/
+    """
+    clean = _clean_name(company)
+    query = (f'"{clean}" AND (merger OR acquisition OR bankruptcy OR shutdown OR '
+             f'restructuring OR renamed OR rebranded OR relocated OR spinoff OR '
+             f'headquarters OR "new name")')
+
+    r = _get(
+        _GDELT_URL,
+        "gdelt",
+        params={
+            "query":      query,
+            "mode":       "artlist",
+            "maxrecords": max_items,
+            "timespan":   getattr(config, "GDELT_TIMESPAN", "12m"),
+            "sort":       "datedesc",
+            "format":     "json",
+        },
     )
     if not r:
         return [], []
 
-    result_blocks = re.findall(
-        r'class="result__title"[^>]*>.*?<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>.*?'
-        r'class="result__snippet"[^>]*>(.*?)</div',
-        r.text, re.DOTALL
-    )
+    try:
+        data = r.json()
+    except Exception:
+        return [], []
 
+    articles = data.get("articles", [])
     sections, urls = [], []
-    for href, title_html, snippet_html in result_blocks:
-        title   = sanitise(title_html)
-        snippet = sanitise_snippet(snippet_html, 400)
-        url     = href.strip()
 
-        if "uddg=" in url:
-            m = re.search(r"uddg=([^&]+)", url)
-            if m:
-                url = urllib.parse.unquote(m.group(1))
+    for article in articles:
+        url      = article.get("url", "")
+        title    = sanitise(article.get("title", ""))
+        domain   = article.get("domain", "")
+        pub_date = article.get("seendate", "")[:8]
 
-        if not url.startswith("http") or url in seen:
+        if not url or url in seen:
             continue
         seen.add(url)
-        sections.append(f"[WEB SEARCH] {title}\n{url}\n{snippet}")
+        sections.append(f"[GDELT] {title} ({pub_date}) — {domain}\n{url}")
         urls.append(url)
+
         if len(sections) >= max_items:
             break
+
+    return sections, urls
+
+
+# ── The Guardian Open Platform ────────────────────────────────────────────────
+_GUARDIAN_URL = "https://content.guardianapis.com/search"
+
+
+def _source_guardian(company: str, seen: set[str], max_items: int = 5) -> tuple[list[str], list[str]]:
+    """
+    The Guardian Open Platform API.
+    Free API key: https://open-platform.theguardian.com/access/
+    Default key "test" works with lower rate limits.
+    5,000 calls/day on free production key.
+    Covers business, M&A, corporate restructuring, bankruptcy from Guardian content.
+    """
+    api_key = getattr(config, "GUARDIAN_API_KEY", "test")
+    clean   = _clean_name(company)
+
+    r = _get(
+        _GUARDIAN_URL,
+        "guardian",
+        params={
+            "q":           (f'"{clean}" AND (merger OR acquisition OR bankruptcy OR '
+                            f'restructuring OR renamed OR redomicile OR spinoff OR shutdown)'),
+            "api-key":     api_key,
+            "section":     "business",
+            "order-by":    "relevance",
+            "page-size":   max_items,
+            "show-fields": "headline,trailText,webPublicationDate",
+            "from-date":   getattr(config, "DATE_START", "2025-01-01"),
+        },
+    )
+    if not r:
+        return [], []
+
+    try:
+        data = r.json()
+    except Exception:
+        return [], []
+
+    results  = data.get("response", {}).get("results", [])
+    sections, urls = [], []
+
+    for item in results:
+        url    = item.get("webUrl", "")
+        fields = item.get("fields", {})
+        title  = sanitise(fields.get("headline", item.get("webTitle", "")))
+        trail  = sanitise_snippet(fields.get("trailText", ""), 400)
+        pub    = item.get("webPublicationDate", "")[:10]
+
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        sections.append(f"[GUARDIAN] {title} ({pub})\n{url}\n{trail}")
+        urls.append(url)
 
     return sections, urls
 
@@ -909,14 +980,17 @@ class SearchLayer:
         # 2. Google News (always — free, no limit)
         _add("google_news", *_source_google_news(company, seen_urls))
 
-        # 3. DuckDuckGo (always — free, no limit)
-        _add("duckduckgo",  *_source_duckduckgo(company, seen_urls))
+        # 3. GDELT Full Text Search (always — free, no key, global news)
+        _add("gdelt",       *_source_gdelt(company, seen_urls))
 
-        # 4. PR Newswire + Business Wire (always — free)
+        # 4. The Guardian Open Platform (always — free API, business section)
+        _add("guardian",    *_source_guardian(company, seen_urls))
+
+        # 5. PR Newswire + Business Wire (always — free)
         _add("prnewswire",   *_source_prnewswire(company, seen_urls))
         _add("businesswire", *_source_businesswire(company, seen_urls))
 
-        # 5. Wikipedia (always — free)
+        # 6. Wikipedia (always — free)
         _add("wikipedia",   *_source_wikipedia(company, seen_urls))
 
         # 6. Brave Search (Stage 2 only, if key configured)

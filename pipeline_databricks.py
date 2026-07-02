@@ -6,7 +6,7 @@
 # MAGIC on Databricks using Foundation Model APIs (no local GPU or llama-server needed).
 # MAGIC
 # MAGIC **Architecture:**
-# MAGIC - Stage 1 — Free sources (EDGAR, Google News, DuckDuckGo, PR Newswire, Business Wire, Wikipedia)
+# MAGIC - Stage 1 — Free sources (EDGAR, Google News, GDELT, The Guardian, PR Newswire, Business Wire, Wikipedia)
 # MAGIC - Stage 1C — Prescreener: `databricks-meta-llama-3-1-8b-instruct` (fast, cheap)
 # MAGIC - Stage 2 — Tavily deep fetch (gated — only for companies that pass prescreener)
 # MAGIC - Stage 2 Classifier — `databricks-qwen3-next-80b-a3b-instruct` (high quality)

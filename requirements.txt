@@ -4,12 +4,24 @@
 # Search — Tavily (free tier, 1,000/month)
 tavily-python>=0.3.0
 
-# HTTP — llama-server client + all free source fetchers
-# (SEC EDGAR, Google News RSS, PR Newswire, Business Wire, Wikipedia all use requests)
+# HTTP — llama-server client + all source fetchers
+# (SEC EDGAR, Google News RSS, GDELT, The Guardian, PR Newswire,
+#  Business Wire, Wikipedia, Brave Search all use requests)
 requests>=2.31.0
 
 # Excel output
 openpyxl>=3.1.2
 
 # Standard library only for everything else
-# (csv, json, argparse, dataclasses, time, os, sys — no extra installs needed)
+# (csv, json, argparse, dataclasses, time, os, sys, xml.etree — no extra installs needed)
+
+# ─── Data sources used (all free, no scraping) ──────────────────────────────
+# SEC EDGAR 8-K        — https://efts.sec.gov (official API, email in UA)
+# Google News RSS      — https://news.google.com/rss (RSS feed, no key)
+# GDELT Full Text API  — https://api.gdeltproject.org (official API, no key)
+# The Guardian API     — https://content.guardianapis.com (free key, 5k/day)
+# PR Newswire RSS      — https://www.prnewswire.com/rss (RSS feed, no key)
+# Business Wire RSS    — https://feed.businesswire.com/rss (RSS feed, no key)
+# Wikipedia REST API   — https://en.wikipedia.org/api/rest_v1 (official API, no key)
+# Tavily Search API    — https://tavily.com (free tier, 1,000/month, Stage 2 only)
+# Brave Search API     — https://api.search.brave.com (optional, Stage 2 only)

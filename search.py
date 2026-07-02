@@ -10,7 +10,8 @@ Free sources (Stage 1):
   3. PR Newswire RSS          — company press releases
   4. Business Wire RSS        — second press release network
   5. Wikipedia REST API       — confirmed shutdowns, rebrands, redomiciles
-  6. DuckDuckGo HTML search   — Google-quality results, no key, no hard limit
+  6. GDELT Full Text Search   — global news, no key, no limit, 65 languages
+  7. The Guardian Open Platform — business/M&A news API, free key, 5,000/day
 
 Stage 2 (Tavily, gated):
   - Only fires when Prescreener says passed=True
@@ -203,78 +204,125 @@ def _fetch_google_news(company: str, seen_urls: set[str], max_items: int = 12) -
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Source 3 — DuckDuckGo HTML search (free, no key, no hard limit)
+# Source 3 — GDELT Full Text Search API (free, no key, global news)
 # ─────────────────────────────────────────────────────────────────────────────
-_DDG_URL = "https://html.duckduckgo.com/html/"
+_GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 
 
-def _fetch_ddg(company: str, seen_urls: set[str], max_items: int = 8) -> tuple[str, list[str]]:
+def _fetch_gdelt(company: str, seen_urls: set[str], max_items: int = 10) -> tuple[str, list[str]]:
     """
-    DuckDuckGo HTML endpoint — returns search result snippets.
-    No API key. Reasonable use policy applies (don't hammer it).
-    Uses a browser-like User-Agent to avoid bot blocks.
+    GDELT 2.0 Full Text Search API — no API key, no hard rate limit.
+    Monitors 100,000+ news sources in 65 languages, updated every 15 minutes.
+    Returns article titles + URLs sorted by relevance.
+    Docs: https://blog.gdeltproject.org/gdelt-2-0-our-global-world-in-realtime/
     """
     clean = _clean_name(company)
-    query = f'"{clean}" (merger OR acquisition OR bankrupt OR shutdown OR renamed OR "new name" OR relocated OR spinoff) {_year_terms()}'
+    _kw = ("merger OR acquisition OR bankruptcy OR shutdown OR "
+           "restructuring OR renamed OR rebranded OR relocated OR spinoff OR "
+           'headquarters OR "new name"')
+    query = f'"{clean}" AND ({_kw})'
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
+    params = {
+        "query":      query,
+        "mode":       "artlist",       # return article list (not timeline/wordcloud)
+        "maxrecords": max_items,
+        "timespan":   getattr(config, "GDELT_TIMESPAN", "12m"),
+        "sort":       "datedesc",      # newest first
+        "format":     "json",
     }
 
     try:
-        r = requests.post(
-            _DDG_URL,
-            data    = {"q": query, "kl": "us-en"},
-            headers = headers,
-            timeout = 12,
-        )
+        r = _SESSION.get(_GDELT_URL, params=params, timeout=12)
         if r.status_code != 200:
             return "", []
-    except requests.RequestException:
+        data = r.json()
+    except Exception:
         return "", []
 
-    # Parse results from HTML using simple regex (avoids BeautifulSoup dep)
-    # DuckDuckGo wraps results in <div class="result__body"> with <a class="result__url">
-    result_blocks = re.findall(
-        r'class="result__title"[^>]*>.*?<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>.*?'
-        r'class="result__snippet"[^>]*>(.*?)</div',
-        r.text, re.DOTALL
-    )
-
+    articles = data.get("articles", [])
     sections, urls = [], []
-    for href, title_html, snippet_html in result_blocks:
-        # Unescape and clean HTML
-        title   = re.sub(r"<[^>]+>", "", title_html).strip()
-        snippet = re.sub(r"<[^>]+>", "", snippet_html).strip()
-        url     = href.strip()
 
-        # DDG wraps real URLs in redirect — extract uddg param if present
-        if "uddg=" in url:
-            m = re.search(r"uddg=([^&]+)", url)
-            if m:
-                url = urllib.parse.unquote(m.group(1))
+    for article in articles:
+        url      = article.get("url", "")
+        title    = article.get("title", "").strip()
+        domain   = article.get("domain", "")
+        pub_date = article.get("seendate", "")[:8]  # YYYYMMDD
 
-        if not url.startswith("http") or url in seen_urls:
+        if not url or url in seen_urls:
             continue
         seen_urls.add(url)
 
-        text = f"[DUCKDUCKGO] {title}\n{url}\n{_truncate(snippet, 400)}"
+        text = f"[GDELT] {title} ({pub_date}) — {domain}\n{url}"
         sections.append(text)
         urls.append(url)
 
         if len(sections) >= max_items:
             break
 
+    time.sleep(getattr(config, "GDELT_DELAY", 0.5))
     return "\n\n".join(sections), urls
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Source 4 — PR Newswire RSS (free, no key)
+# Source 4 (alt) — The Guardian Open Platform (free API, 5,000 calls/day)
+# ─────────────────────────────────────────────────────────────────────────────
+_GUARDIAN_URL = "https://content.guardianapis.com/search"
+
+
+def _fetch_guardian(company: str, seen_urls: set[str], max_items: int = 5) -> tuple[str, list[str]]:
+    """
+    The Guardian Open Platform API.
+    Free key: https://open-platform.theguardian.com/access/
+    Default key "test" works but with tighter rate limits.
+    Covers business, M&A, corporate restructuring, bankruptcy from Guardian content.
+    """
+    api_key = getattr(config, "GUARDIAN_API_KEY", "test")
+    clean   = _clean_name(company)
+
+    _gkw = ("merger OR acquisition OR bankruptcy OR restructuring OR "
+            'renamed OR redomicile OR spinoff OR shutdown OR "new name"')
+    params = {
+        "q":           f'"{clean}" AND ({_gkw})',
+        "api-key":     api_key,
+        "section":     "business",      # business section only — more relevant
+        "order-by":    "relevance",
+        "page-size":   max_items,
+        "show-fields": "headline,trailText,webPublicationDate",
+        "from-date":   getattr(config, "DATE_START", "2025-01-01"),
+    }
+
+    try:
+        r = _SESSION.get(_GUARDIAN_URL, params=params, timeout=10)
+        if r.status_code != 200:
+            return "", []
+        data = r.json()
+    except Exception:
+        return "", []
+
+    results  = data.get("response", {}).get("results", [])
+    sections, urls = [], []
+
+    for item in results:
+        url    = item.get("webUrl", "")
+        fields = item.get("fields", {})
+        title  = fields.get("headline", item.get("webTitle", "")).strip()
+        trail  = fields.get("trailText", "").strip()
+        pub    = item.get("webPublicationDate", "")[:10]
+
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        text = f"[GUARDIAN] {title} ({pub})\n{url}\n{_truncate(trail, 400)}"
+        sections.append(text)
+        urls.append(url)
+
+    time.sleep(getattr(config, "GUARDIAN_DELAY", 0.2))
+    return "\n\n".join(sections), urls
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Source 5 — PR Newswire RSS (free, no key)
 # ─────────────────────────────────────────────────────────────────────────────
 _PRNEWSWIRE_RSS = "https://www.prnewswire.com/rss/news-releases-list.rss"
 
@@ -314,7 +362,7 @@ def _fetch_prnewswire(company: str, seen_urls: set[str], max_items: int = 4) -> 
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Source 5 — Business Wire RSS (free, no key)
+# Source 6 — Business Wire RSS (free, no key)
 # ─────────────────────────────────────────────────────────────────────────────
 _BUSINESSWIRE_RSS = "https://feed.businesswire.com/rss/home/?rss=G1&rssid=20"
 
@@ -354,7 +402,7 @@ def _fetch_businesswire(company: str, seen_urls: set[str], max_items: int = 4) -
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Source 6 — Wikipedia REST API (free, no key)
+# Source 7 — Wikipedia REST API (free, no key)
 # ─────────────────────────────────────────────────────────────────────────────
 _WIKI_API = "https://en.wikipedia.org/api/rest_v1/page/summary/{}"
 
@@ -415,28 +463,35 @@ def fetch_stage1(company: str) -> StageOneResult:
         all_urls.extend(urls)
         breakdown["google_news"] = len(ctx)
 
-    # 3. DuckDuckGo
-    ctx, urls = _fetch_ddg(company, seen_urls)
+    # 3. GDELT Full Text Search (free, no key, global news)
+    ctx, urls = _fetch_gdelt(company, seen_urls)
     if ctx:
-        all_sections.append("=== WEB SEARCH ===\n" + ctx)
+        all_sections.append("=== GDELT NEWS ===\n" + ctx)
         all_urls.extend(urls)
-        breakdown["duckduckgo"] = len(ctx)
+        breakdown["gdelt"] = len(ctx)
 
-    # 4. PR Newswire
+    # 4. The Guardian (free API key, business section)
+    ctx, urls = _fetch_guardian(company, seen_urls)
+    if ctx:
+        all_sections.append("=== THE GUARDIAN ===\n" + ctx)
+        all_urls.extend(urls)
+        breakdown["guardian"] = len(ctx)
+
+    # 5. PR Newswire
     ctx, urls = _fetch_prnewswire(company, seen_urls)
     if ctx:
         all_sections.append("=== PR NEWSWIRE ===\n" + ctx)
         all_urls.extend(urls)
         breakdown["prnewswire"] = len(ctx)
 
-    # 5. Business Wire
+    # 6. Business Wire
     ctx, urls = _fetch_businesswire(company, seen_urls)
     if ctx:
         all_sections.append("=== BUSINESS WIRE ===\n" + ctx)
         all_urls.extend(urls)
         breakdown["businesswire"] = len(ctx)
 
-    # 6. Wikipedia
+    # 7. Wikipedia
     ctx, urls = _fetch_wikipedia(company, seen_urls)
     if ctx:
         all_sections.append("=== WIKIPEDIA ===\n" + ctx)
