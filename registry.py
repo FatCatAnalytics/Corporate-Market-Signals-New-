@@ -183,75 +183,129 @@ _GLEIF_URL   = "https://api.gleif.org/api/v1/lei-records"
 _gleif_last  = [0.0]
 
 
-def lookup_gleif(company: str, iso_country: Optional[str]) -> tuple[str, str, list[str], list[str]]:
-    """Returns (context_section, headline_line, source_urls, flags)."""
+def lookup_gleif(
+    company:     str,
+    iso_country: Optional[str],
+    lei:         str = "",
+) -> tuple[str, str, list[str], list[str]]:
+    """
+    Returns (context_section, headline_line, source_urls, flags).
+
+    When the input list supplies an LEI, the record is fetched directly —
+    deterministic, no fuzzy-match risk. Name search is the fallback.
+    """
     _rate_limit(_gleif_last, getattr(config, "GLEIF_DELAY", 1.05))
 
-    params = {"filter[fulltext]": company, "page[size]": 10}
-    if iso_country:
-        params["filter[entity.legalAddress.country]"] = iso_country
-    r = _get(_GLEIF_URL, params=params)
-    if not r:
-        return "", "", [], []
-    try:
-        records = r.json().get("data", [])
-    except Exception:
-        return "", "", [], []
-
     best, best_score = None, 0.0
-    for rec in records:
-        ent   = rec.get("attributes", {}).get("entity", {})
-        lname = (ent.get("legalName") or {}).get("name", "")
-        score = _match_score(company, lname)
-        if score > best_score:
-            best, best_score = rec, score
-    if best is None or best_score < _MATCH_THRESHOLD:
-        return "", "", [], []
+
+    if lei:
+        r = _get(f"{_GLEIF_URL}/{lei}")
+        if r:
+            try:
+                best = r.json().get("data") or None
+                best_score = 3.0   # exact by construction
+            except Exception:
+                best = None
+
+    if best is None:
+        params = {"filter[fulltext]": company, "page[size]": 10}
+        if iso_country:
+            params["filter[entity.legalAddress.country]"] = iso_country
+        r = _get(_GLEIF_URL, params=params)
+        if not r:
+            return "", "", [], []
+        try:
+            records = r.json().get("data", [])
+        except Exception:
+            return "", "", [], []
+
+        for rec in records:
+            ent   = rec.get("attributes", {}).get("entity", {})
+            lname = (ent.get("legalName") or {}).get("name", "")
+            score = _match_score(company, lname)
+            if score > best_score:
+                best, best_score = rec, score
+        if best is None or best_score < _MATCH_THRESHOLD:
+            return "", "", [], []
 
     attrs = best.get("attributes", {})
     ent   = attrs.get("entity", {})
     reg   = attrs.get("registration", {})
-    lei   = attrs.get("lei", "")
-    lname = (ent.get("legalName") or {}).get("name", "")
+
+    successor  = ent.get("successorEntity") or {}
+    successors = ent.get("successorEntities") or []
+    expiration = ent.get("expiration") or {}
+    legal_addr = ent.get("legalAddress") or {}
+    hq_addr    = ent.get("headquartersAddress") or {}
+
+    rec = {
+        "lei":           attrs.get("lei", ""),
+        "legal_name":    (ent.get("legalName") or {}).get("name", ""),
+        "status":        ent.get("status", ""),
+        "reg_status":    reg.get("status", ""),
+        "last_update":   str(reg.get("lastUpdateDate", ""))[:10],
+        "prev_names":    [o.get("name") for o in (ent.get("otherNames") or [])
+                          if o.get("type") == "PREVIOUS_LEGAL_NAME" and o.get("name")],
+        "succ_names":    [n for n in
+                          [(successor.get("name") if isinstance(successor, dict) else None)]
+                          + [(s.get("name") if isinstance(s, dict) else None) for s in successors]
+                          if n],
+        "exp_date":      expiration.get("date") or "",
+        "exp_reason":    expiration.get("reason") or "",
+        "legal_city":    legal_addr.get("city", "?"),
+        "legal_country": legal_addr.get("country", ""),
+        "hq_city":       hq_addr.get("city", "?"),
+        "hq_country":    hq_addr.get("country", ""),
+        "parent_name":   "",   # only available via the Level 2 Delta path
+    }
+    return format_gleif_record(company, rec, iso_country)
+
+
+def format_gleif_record(
+    company:     str,
+    rec:         dict,
+    iso_country: Optional[str],
+) -> tuple[str, str, list[str], list[str]]:
+    """
+    Render a normalised GLEIF record dict into (context_section,
+    headline_line, source_urls, flags). Shared by the live-API path
+    (lookup_gleif) and the Delta-table path (registry_delta.py).
+    """
+    lei   = rec.get("lei", "")
+    lname = rec.get("legal_name", "")
 
     # Previous legal names — drop punctuation-only or translation-only
     # variants (same normalised tokens as the current name), which would
     # otherwise read as fake rename signals downstream.
-    prev_names = [o.get("name") for o in (ent.get("otherNames") or [])
-                  if o.get("type") == "PREVIOUS_LEGAL_NAME" and o.get("name")
-                  and _norm_tokens(o["name"]) != _norm_tokens(lname)]
-    status     = ent.get("status", "")
-    expiration = ent.get("expiration") or {}
-    successor  = ent.get("successorEntity") or {}
-    successors = ent.get("successorEntities") or []
-    succ_names = [n for n in
-                  [(successor.get("name") if isinstance(successor, dict) else None)]
-                  + [(s.get("name") if isinstance(s, dict) else None) for s in successors]
-                  if n]
-    legal_addr = ent.get("legalAddress") or {}
-    hq_addr    = ent.get("headquartersAddress") or {}
+    prev_names = [p for p in (rec.get("prev_names") or [])
+                  if p and _norm_tokens(p) != _norm_tokens(lname)]
+    succ_names = [s for s in (rec.get("succ_names") or []) if s]
+    status     = rec.get("status", "")
 
     flags = []
     lines = [f"Matched legal entity: {lname} (LEI {lei})",
-             f"Entity status: {status or 'unknown'} | Registration: {reg.get('status','')}"]
+             f"Entity status: {status or 'unknown'} | Registration: {rec.get('reg_status','')}"]
     if prev_names:
         lines.append(f"PREVIOUS LEGAL NAME(S): {'; '.join(prev_names)}")
         flags.append("gleif_previous_name")
     if status == "INACTIVE":
         flags.append("gleif_inactive")
-    if expiration.get("reason"):
-        lines.append(f"Entity expired: {expiration.get('date','')} — reason: {expiration['reason']}")
-        flags.append(f"gleif_expired_{expiration['reason'].lower()}")
+    if rec.get("exp_reason"):
+        lines.append(f"Entity expired: {rec.get('exp_date','')} — reason: {rec['exp_reason']}")
+        flags.append(f"gleif_expired_{rec['exp_reason'].lower()}")
     if succ_names:
         lines.append(f"SUCCESSOR ENTITY: {'; '.join(succ_names)}")
         flags.append("gleif_successor")
-    lines.append(f"HQ: {hq_addr.get('city','?')}, {hq_addr.get('country','?')} | "
-                 f"Legal seat: {legal_addr.get('city','?')}, {legal_addr.get('country','?')}")
-    if iso_country and legal_addr.get("country") and legal_addr["country"] != iso_country:
-        lines.append(f"NOTE: legal seat country {legal_addr['country']} differs "
+    if rec.get("parent_name"):
+        lines.append(f"Ultimate parent: {rec['parent_name']}")
+    lines.append(f"HQ: {rec.get('hq_city','?')}, {rec.get('hq_country','?')} | "
+                 f"Legal seat: {rec.get('legal_city','?')}, {rec.get('legal_country','?')}")
+    if iso_country and rec.get("legal_country") and rec["legal_country"] != iso_country:
+        lines.append(f"NOTE: legal seat country {rec['legal_country']} differs "
                      f"from expected {iso_country} (possible redomicile or subsidiary match)")
         flags.append("gleif_country_mismatch")
-    lines.append(f"Record last updated: {str(reg.get('lastUpdateDate',''))[:10]}")
+    if rec.get("last_update"):
+        lines.append(f"Record last updated: {rec['last_update']}")
 
     url      = f"https://search.gleif.org/#/record/{lei}"
     section  = f"[GLEIF REGISTRY] {company}\n{url}\n" + "\n".join(lines)
@@ -453,16 +507,31 @@ def lookup_companies_house(company: str) -> tuple[str, str, list[str], list[str]
 # ─────────────────────────────────────────────────────────────────────────────
 # Orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
-def lookup(company: str, country_hint: str = "") -> RegistryResult:
+def lookup(
+    company:      str,
+    country_hint: str = "",
+    gleif_map:    Optional[dict] = None,
+    lei:          str = "",
+) -> RegistryResult:
     """
     Run all applicable registry lookups for one company.
     country_hint is the raw CSV 'Country HQ' value (may be '').
+    lei is the company's LEI from the input CSV ('' if absent) — when
+    present, the GLEIF API record is fetched directly by ID.
+
+    gleif_map: prebuilt {company: (section, headline, urls, flags)} from
+    registry_delta.build_gleif_map (Databricks Delta tables). When given,
+    the GLEIF API is NOT called — a miss in the full golden copy means the
+    entity has no LEI, so there is nothing to fall back to.
     """
     iso    = country_to_iso(country_hint)
     result = RegistryResult(company=company)
     sections, headlines = [], []
 
-    fetchers = [("gleif", lambda: lookup_gleif(company, iso))]
+    if gleif_map is not None:
+        fetchers = [("gleif", lambda: gleif_map.get(company) or ("", "", [], []))]
+    else:
+        fetchers = [("gleif", lambda: lookup_gleif(company, iso, lei))]
     if iso == "US":
         fetchers.append(("sec_registry", lambda: lookup_sec(company)))
     if iso == "GB":

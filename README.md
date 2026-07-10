@@ -158,6 +158,19 @@ Registry lookups use conservative name matching (country-filtered, token
 scoring) and always state the matched legal entity, so the classifier can
 discount subsidiary or fund mismatches.
 
+**LEI column:** if the input CSV has an `LEI` column, GLEIF records are
+fetched directly by ID — deterministic, no name-matching risk. Non-LEI
+values like `-` are ignored.
+
+**GLEIF from Delta tables (Databricks):** if the GLEIF golden copy lives
+in Unity Catalog Delta tables, set the `gleif_level1_table` (and
+optionally `gleif_level2_table` for ultimate-parent facts) job parameters.
+Registry facts then come from ONE batch Spark join at pipeline start —
+LEI-keyed where the input provides LEIs, name-matched otherwise — and the
+GLEIF API is not called at all. See `registry_delta.build_gleif_map`.
+Keep the Delta copy fresh: GLEIF publishes daily golden copies, and stale
+tables mean stale status/rename facts.
+
 Recommended secret location:
 
 ```text

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 import importlib
 import json
 import os
@@ -68,9 +69,11 @@ except ImportError:
 # CSV reader
 # ─────────────────────────────────────────────────────────────────────────────
 
-_COMPANY_COL_ALIASES = {"company", "company_name", "name", "entity"}
+_COMPANY_COL_ALIASES = {"company", "company_name", "name", "entity",
+                        "coalition names", "company name"}
 _SECTOR_COL_ALIASES  = {"sector", "industry", "subsector"}
 _COUNTRY_COL_ALIASES = {"country hq", "country_hq", "country", "hq country", "hq_country"}
+_LEI_COL_ALIASES     = {"lei", "lei id", "lei_id", "lei code", "lei_code"}
 
 
 def _find_col(header: list[str], aliases: set[str]) -> Optional[int]:
@@ -78,6 +81,18 @@ def _find_col(header: list[str], aliases: set[str]) -> Optional[int]:
         if h.strip().lower() in aliases:
             return i
     return None
+
+
+def _find_name_col_fuzzy(header: list[str]) -> Optional[int]:
+    """Last resort before column 0: any header containing 'name' or 'company'."""
+    for i, h in enumerate(header):
+        hl = h.strip().lower()
+        if "name" in hl or "company" in hl:
+            return i
+    return None
+
+
+_LEI_RE = re.compile(r"^[A-Z0-9]{20}$")
 
 
 def _sniff_delimiter(csv_path: str) -> str:
@@ -94,13 +109,14 @@ def _sniff_delimiter(csv_path: str) -> str:
     return ","
 
 
-def load_companies(csv_path: str) -> List[Tuple[str, str, str]]:
+def load_companies(csv_path: str) -> List[Tuple[str, str, str, str]]:
     """
-    Return list of (company_name, sector_hint, country_hint).
-    sector_hint / country_hint are empty strings if the column is absent.
+    Return list of (company_name, sector_hint, country_hint, lei).
+    sector_hint / country_hint / lei are empty strings if absent. LEI values
+    that are not valid 20-char ISO 17442 codes (e.g. '-') come back as ''.
     Handles comma-, tab-, and semicolon-separated files.
     """
-    companies: List[Tuple[str, str, str]] = []
+    companies: List[Tuple[str, str, str, str]] = []
     delimiter = _sniff_delimiter(csv_path)
     with open(csv_path, newline="", encoding="utf-8-sig") as fh:
         reader = csv.reader(fh, delimiter=delimiter)
@@ -111,7 +127,10 @@ def load_companies(csv_path: str) -> List[Tuple[str, str, str]]:
         name_col    = _find_col(header, _COMPANY_COL_ALIASES)
         sector_col  = _find_col(header, _SECTOR_COL_ALIASES)
         country_col = _find_col(header, _COUNTRY_COL_ALIASES)
+        lei_col     = _find_col(header, _LEI_COL_ALIASES)
 
+        if name_col is None:
+            name_col = _find_name_col_fuzzy(header)
         if name_col is None:
             # Fall back: just use the first column
             print(f"  [WARNING] No recognised company column found. "
@@ -124,8 +143,11 @@ def load_companies(csv_path: str) -> List[Tuple[str, str, str]]:
             name    = row[name_col].strip()
             sector  = row[sector_col].strip()  if sector_col  is not None and sector_col  < len(row) else ""
             country = row[country_col].strip() if country_col is not None and country_col < len(row) else ""
+            lei     = row[lei_col].strip().upper() if lei_col is not None and lei_col < len(row) else ""
+            if not _LEI_RE.match(lei):
+                lei = ""
             if name:
-                companies.append((name, sector, country))
+                companies.append((name, sector, country, lei))
 
     return companies
 
@@ -192,6 +214,7 @@ def run_pipeline(
     tavily_key:     Optional[str] = None,
     resume:         bool          = True,
     max_companies:  Optional[int] = None,
+    gleif_map:      Optional[dict] = None,
 ) -> List[SignalResult]:
     """
     Main pipeline.  Returns the list of SignalResult objects.
@@ -199,6 +222,12 @@ def run_pipeline(
     max_companies:
       0 or None = process all companies.
       N > 0     = process only the first N companies from the input CSV.
+
+    gleif_map:
+      Prebuilt GLEIF facts from registry_delta.build_gleif_map (Databricks
+      Delta tables). When provided, the GLEIF API is not called at all.
+      When None (default, e.g. local runs), GLEIF is queried via its
+      public API — by LEI directly when the input CSV has an LEI column.
     """
     # ── resolve paths ─────────────────────────────────────────────────────────
     input_csv   = os.path.abspath(input_csv)
@@ -232,11 +261,11 @@ def run_pipeline(
         done_raw = _load_checkpoint(output_xlsx)
 
     # Only consider checkpoint entries for this selected batch.
-    selected_companies = {name for name, _sector, _country in companies}
+    selected_companies = {name for name, _sector, _country, _lei in companies}
     done_raw = {k: v for k, v in done_raw.items() if k in selected_companies}
     done_set = set(done_raw.keys())
 
-    remaining = [(n, s, c) for n, s, c in companies if n not in done_set]
+    remaining = [(n, s, c, l) for n, s, c, l in companies if n not in done_set]
     print(f"  To process: {len(remaining)} (skipping {len(done_set)} already done)\n")
 
     # ── initialise Tavily searcher ────────────────────────────────────────────
@@ -262,7 +291,7 @@ def run_pipeline(
     # ── process each company ─────────────────────────────────────────────────
     start_time = time.time()
 
-    for idx, (company, sector, country) in enumerate(remaining, start=1):
+    for idx, (company, sector, country, lei) in enumerate(remaining, start=1):
         total_remaining = len(remaining)
         print(f"  [{idx:3d}/{total_remaining}] {company}")
 
@@ -276,7 +305,7 @@ def run_pipeline(
         #     an INACTIVE status or previous legal name should trigger Stage 2
         #     even when the news headlines look quiet.
         if getattr(config, "REGISTRY_ENABLED", False):
-            reg = registry_lookup(company, country)
+            reg = registry_lookup(company, country, gleif_map=gleif_map, lei=lei)
             if reg.context:
                 s1.full_context     = (reg.context + "\n\n" + s1.full_context)
                 s1.headline_text    = (reg.headline + "\n" + s1.headline_text).strip()
@@ -362,7 +391,7 @@ def run_pipeline(
 
     # ── reconstruct full results list in selected CSV order ──────────────────
     all_results: List[SignalResult] = []
-    for company, _sector, _country in companies:
+    for company, _sector, _country, _lei in companies:
         if company in done_raw:
             all_results.append(_result_from_dict(done_raw[company]))
         else:

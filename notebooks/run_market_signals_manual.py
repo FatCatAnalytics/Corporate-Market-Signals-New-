@@ -68,6 +68,20 @@ dbutils.widgets.text(
     "databricks-meta-llama-3-1-8b-instruct",
 )
 
+# GLEIF golden-copy Delta tables (Unity Catalog). When gleif_level1_table is
+# set, GLEIF registry facts come from ONE batch join instead of per-company
+# API calls (60 req/min → ~85 min saved on a 5,000-company list).
+# Leave empty to use the GLEIF public API instead.
+dbutils.widgets.text(
+    "gleif_level1_table",
+    "",
+)
+
+dbutils.widgets.text(
+    "gleif_level2_table",   # relationships (RR) — enables ultimate-parent facts
+    "",
+)
+
 # COMMAND ----------
 
 PIPELINE_DIR = dbutils.widgets.get("pipeline_dir")
@@ -191,7 +205,23 @@ importlib.reload(pipeline)
 
 import shutil
 import tempfile
-from pipeline import run_pipeline
+from pipeline import load_companies, run_pipeline
+
+# ── GLEIF from Delta tables (one batch join instead of ~85 min of API calls) ──
+GLEIF_L1 = dbutils.widgets.get("gleif_level1_table").strip()
+GLEIF_L2 = dbutils.widgets.get("gleif_level2_table").strip() or None
+
+gleif_map = None
+if GLEIF_L1:
+    import registry_delta
+    importlib.reload(registry_delta)
+    _companies = load_companies(INPUT_CSV)
+    gleif_map = registry_delta.build_gleif_map(
+        spark,
+        [(name, country, lei) for name, _sector, country, lei in _companies],
+        level1_table=GLEIF_L1,
+        level2_table=GLEIF_L2,
+    )
 
 # Write Excel to local temp file first — Volume FUSE doesn't support seek for zip/xlsx writes
 _tmp_xlsx = os.path.join(tempfile.gettempdir(), os.path.basename(OUTPUT_XLSX))
@@ -204,6 +234,7 @@ results = run_pipeline(
     tavily_key=config.TAVILY_API_KEY if not config.TAVILY_API_KEY.startswith("tvly-YOUR") else None,
     resume=RESUME,
     max_companies=MAX_COMPANIES,
+    gleif_map=gleif_map,
 )
 
 shutil.copy2(_tmp_xlsx, OUTPUT_XLSX)
