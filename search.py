@@ -116,6 +116,28 @@ _EDGAR_SEARCH_URL = "https://efts.sec.gov/LATEST/search-index"
 _EDGAR_FILING_BASE = "https://www.sec.gov"
 
 
+def _edgar_filing_url(hit: dict) -> str:
+    """
+    Build the document URL from an EDGAR full-text-search hit.
+    (The FTS response has no 'file_url' field — the URL must be derived
+    from _id = "<accession>:<filename>" plus the CIK.)
+    """
+    src = hit.get("_source", {})
+    _id = hit.get("_id", "")
+    if ":" not in _id:
+        return ""
+    adsh, filename = _id.split(":", 1)
+    ciks = src.get("ciks") or []
+    if not ciks or not filename:
+        return ""
+    try:
+        cik = int(ciks[0])
+    except (TypeError, ValueError):
+        return ""
+    return (f"{_EDGAR_FILING_BASE}/Archives/edgar/data/{cik}/"
+            f"{adsh.replace('-', '')}/{filename}")
+
+
 def _fetch_edgar(company: str, max_filings: int = 5) -> tuple[str, list[str]]:
     clean = _clean_name(company)
     params = {
@@ -141,13 +163,17 @@ def _fetch_edgar(company: str, max_filings: int = 5) -> tuple[str, list[str]]:
     sections, urls = [], []
     for hit in hits:
         src         = hit.get("_source", {})
-        entity_name = src.get("entity_name", company)
+        entity_name = (src.get("display_names") or [company])[0]
         file_date   = src.get("file_date", "")
-        form_type   = src.get("form_type", "8-K")
+        form_type   = src.get("form", "8-K")
         description = src.get("file_description", "")
-        filing_url  = _EDGAR_FILING_BASE + src.get("file_url", "")
+        items       = ", ".join(src.get("items") or [])
+        filing_url  = _edgar_filing_url(hit)
+        if not filing_url:
+            continue
 
-        text = (f"[SEC EDGAR {form_type}] {entity_name} — {file_date}\n"
+        text = (f"[SEC EDGAR {form_type}] {entity_name} — {file_date}"
+                f"{'  (items ' + items + ')' if items else ''}\n"
                 f"{description}\n{filing_url}")
         sections.append(text)
         urls.append(filing_url)

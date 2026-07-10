@@ -200,6 +200,32 @@ GUARDIAN_MAX_RESULTS: int = 5    # articles per company query
 GUARDIAN_DELAY: float = 0.2      # polite delay (seconds)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FREE FULL-TEXT ENRICHMENT  (official APIs only — no Tavily credits needed)
+# ─────────────────────────────────────────────────────────────────────────────
+# When the prescreener flags a company, fetch full text from free official
+# sources: actual SEC 8-K filing documents, Guardian article bodies
+# (show-fields=body), and full Wikipedia articles. Runs alongside Tavily if
+# a key is configured, or entirely instead of it if not.
+FULLTEXT_ENABLED: bool = _bool_env("FULLTEXT_ENABLED", "True")
+
+# SEC EDGAR filing documents (free, no key, 10 req/s guideline)
+FULLTEXT_EDGAR_MAX_DOCS:      int   = _int_env("FULLTEXT_EDGAR_MAX_DOCS", 3)
+FULLTEXT_EDGAR_CHARS_PER_DOC: int   = 4_000
+FULLTEXT_EDGAR_DELAY:         float = 0.15   # seconds between doc fetches
+
+# Guardian full article bodies (free key, 5,000 calls/day)
+FULLTEXT_GUARDIAN_MAX_ARTICLES:      int = 3
+FULLTEXT_GUARDIAN_CHARS_PER_ARTICLE: int = 3_000
+
+# Wikipedia full article (free, official MediaWiki Action API)
+FULLTEXT_WIKIPEDIA_MAX_CHARS: int = 4_000
+
+# Chars of Stage 1 headline context preserved when full text is appended.
+# The rest of the context window (CONTEXT_CHUNK_SIZE × MAX_CONTEXT_CHUNKS)
+# is given to full text. Headlines keep breadth; full text adds depth.
+FULLTEXT_STAGE1_BUDGET: int = 6_000
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CACHE
 # ─────────────────────────────────────────────────────────────────────────────
 # Search results are cached to avoid redundant API calls within a batch.

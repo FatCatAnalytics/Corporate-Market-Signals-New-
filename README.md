@@ -115,9 +115,23 @@ Upload your CSV to:
 /Volumes/data_poc_ws/default/client_intelligence_analytics/market_signals/input/company_list.csv
 ```
 
-### 4. Add Tavily key as a Databricks secret
+### 4. Add Tavily key as a Databricks secret (optional)
 
-The pipeline can run without Tavily, but Tavily improves Stage 2 evidence gathering.
+The pipeline runs fully without Tavily. When the prescreener flags a company,
+Stage 2 gathers deep evidence from **free official full-text sources**
+(no credits, no keys required beyond a real email for SEC EDGAR):
+
+- **SEC EDGAR filing documents** — the actual 8-K filings and press-release
+  exhibits, both filings *by* the company and third-party filings that
+  mention it (e.g. the acquirer's 8-K in an M&A deal).
+- **The Guardian article bodies** — complete article text via the official
+  Open Platform API (`show-fields=body`), 5,000 calls/day on a free key.
+- **Wikipedia full articles** — corporate history sections via the
+  MediaWiki Action API.
+
+This is controlled by `FULLTEXT_ENABLED` in `config.py` (default `True`).
+If a Tavily key **is** configured, Tavily runs in addition to — not instead
+of — the free full-text sources.
 
 Recommended secret location:
 

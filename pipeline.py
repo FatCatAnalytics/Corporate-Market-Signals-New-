@@ -51,6 +51,7 @@ from typing import List, Optional, Tuple
 
 import config
 from search import fetch_stage1, fetch_stage2, FetchResult, StageOneResult
+from fulltext import enrich_with_fulltext, stage1_to_fetchresult
 from classifier import Classifier, SignalResult, make_classifier
 from excel_writer import write_report
 from prescreener import Prescreener, PrescreenResult
@@ -226,8 +227,9 @@ def run_pipeline(
     else:
         print(
             "  [INFO] Tavily key not set or unavailable.\n"
-            "  Stage 2 deep fetch disabled — free sources only.\n"
-            "  Set TAVILY_API_KEY in config.py for deeper coverage."
+            "  Stage 2 will use FREE full-text sources instead\n"
+            "  (SEC filing documents, Guardian article bodies, Wikipedia).\n"
+            "  Set TAVILY_API_KEY in config.py to add Tavily on top."
         )
 
     # ── initialise prescreener + classifier ───────────────────────────────────
@@ -259,15 +261,30 @@ def run_pipeline(
             "reason":  ps.reason,
         })
 
-        if ps.passed and tavily_client is not None:
-            print(f"          → Prescreener PASS (score={ps.score}: {ps.reason}) — running Stage 2")
-            fetch: FetchResult = fetch_stage2(company, s1, tavily_client)
-            print(f"          → Stage 2: {fetch.char_count:,} chars total")
-        else:
-            if not ps.passed:
-                print(f"          → Prescreener SKIP ({ps.stage}, score={ps.score}: {ps.reason})")
+        if ps.passed:
+            if tavily_client is not None:
+                print(f"          → Prescreener PASS (score={ps.score}: {ps.reason}) — running Stage 2 (Tavily)")
+                fetch: FetchResult = fetch_stage2(company, s1, tavily_client)
+                print(f"          → Stage 2: {fetch.char_count:,} chars total")
             else:
-                print(f"          → Tavily not configured — using Stage 1 context only")
+                print(f"          → Prescreener PASS (score={ps.score}: {ps.reason}) — Tavily not configured")
+                fetch = stage1_to_fetchresult(s1)
+
+            # Free full-text enrichment (official APIs — no credits used).
+            # Runs for every prescreener-passed company, with or without Tavily.
+            if getattr(config, "FULLTEXT_ENABLED", False):
+                fetch = enrich_with_fulltext(company, fetch)
+                ft_chars = sum(v for k, v in fetch.source_breakdown.items()
+                               if k.endswith("_fulltext"))
+                if ft_chars:
+                    ft_bd = "  ".join(f"{k}:{v:,}c"
+                                      for k, v in fetch.source_breakdown.items()
+                                      if k.endswith("_fulltext"))
+                    print(f"          → Full text (free): +{ft_chars:,} chars  [{ft_bd}]")
+                else:
+                    print(f"          → Full text (free): no documents found")
+        else:
+            print(f"          → Prescreener SKIP ({ps.stage}, score={ps.score}: {ps.reason})")
             fetch = FetchResult(
                 company          = company,
                 context          = s1.full_context,
@@ -329,7 +346,10 @@ def run_pipeline(
             writer.writerows(prescreen_log)
         triggered  = sum(1 for r in prescreen_log if r["passed"])
         print(f"  Prescreener: {triggered}/{len(prescreen_log)} triggered Stage 2")
-        print(f"  Tavily calls used: ~{triggered * 5} of 1,000 free/month")
+        if tavily_client is not None:
+            print(f"  Tavily calls used: ~{triggered * 5} of 1,000 free/month")
+        else:
+            print(f"  Tavily not used — Stage 2 served by free full-text sources")
         print(f"  Prescreener log: {log_path}")
 
     # ── write Excel ───────────────────────────────────────────────────────────
