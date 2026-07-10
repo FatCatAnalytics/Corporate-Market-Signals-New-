@@ -52,6 +52,7 @@ from typing import List, Optional, Tuple
 import config
 from search import fetch_stage1, fetch_stage2, FetchResult, StageOneResult
 from fulltext import enrich_with_fulltext, stage1_to_fetchresult
+from registry import lookup as registry_lookup
 from classifier import Classifier, SignalResult, make_classifier
 from excel_writer import write_report
 from prescreener import Prescreener, PrescreenResult
@@ -69,6 +70,7 @@ except ImportError:
 
 _COMPANY_COL_ALIASES = {"company", "company_name", "name", "entity"}
 _SECTOR_COL_ALIASES  = {"sector", "industry", "subsector"}
+_COUNTRY_COL_ALIASES = {"country hq", "country_hq", "country", "hq country", "hq_country"}
 
 
 def _find_col(header: list[str], aliases: set[str]) -> Optional[int]:
@@ -78,20 +80,37 @@ def _find_col(header: list[str], aliases: set[str]) -> Optional[int]:
     return None
 
 
-def load_companies(csv_path: str) -> List[Tuple[str, str]]:
+def _sniff_delimiter(csv_path: str) -> str:
     """
-    Return list of (company_name, sector_hint).
-    sector_hint is empty string if the column is absent.
+    Detect the field delimiter from the header line. Company lists are
+    frequently exported as tab-separated files, and company names contain
+    commas ("Aarons, Inc.") — a comma reader silently mangles those.
     """
-    companies: List[Tuple[str, str]] = []
     with open(csv_path, newline="", encoding="utf-8-sig") as fh:
-        reader = csv.reader(fh)
+        first_line = fh.readline()
+    for delim in ("\t", ";", ","):
+        if delim in first_line:
+            return delim
+    return ","
+
+
+def load_companies(csv_path: str) -> List[Tuple[str, str, str]]:
+    """
+    Return list of (company_name, sector_hint, country_hint).
+    sector_hint / country_hint are empty strings if the column is absent.
+    Handles comma-, tab-, and semicolon-separated files.
+    """
+    companies: List[Tuple[str, str, str]] = []
+    delimiter = _sniff_delimiter(csv_path)
+    with open(csv_path, newline="", encoding="utf-8-sig") as fh:
+        reader = csv.reader(fh, delimiter=delimiter)
         header = next(reader, None)
         if header is None:
             raise ValueError(f"CSV is empty: {csv_path}")
 
-        name_col   = _find_col(header, _COMPANY_COL_ALIASES)
-        sector_col = _find_col(header, _SECTOR_COL_ALIASES)
+        name_col    = _find_col(header, _COMPANY_COL_ALIASES)
+        sector_col  = _find_col(header, _SECTOR_COL_ALIASES)
+        country_col = _find_col(header, _COUNTRY_COL_ALIASES)
 
         if name_col is None:
             # Fall back: just use the first column
@@ -102,10 +121,11 @@ def load_companies(csv_path: str) -> List[Tuple[str, str]]:
         for row in reader:
             if not row:
                 continue
-            name   = row[name_col].strip()
-            sector = row[sector_col].strip() if sector_col is not None and sector_col < len(row) else ""
+            name    = row[name_col].strip()
+            sector  = row[sector_col].strip()  if sector_col  is not None and sector_col  < len(row) else ""
+            country = row[country_col].strip() if country_col is not None and country_col < len(row) else ""
             if name:
-                companies.append((name, sector))
+                companies.append((name, sector, country))
 
     return companies
 
@@ -212,11 +232,11 @@ def run_pipeline(
         done_raw = _load_checkpoint(output_xlsx)
 
     # Only consider checkpoint entries for this selected batch.
-    selected_companies = {name for name, _sector in companies}
+    selected_companies = {name for name, _sector, _country in companies}
     done_raw = {k: v for k, v in done_raw.items() if k in selected_companies}
     done_set = set(done_raw.keys())
 
-    remaining = [(n, s) for n, s in companies if n not in done_set]
+    remaining = [(n, s, c) for n, s, c in companies if n not in done_set]
     print(f"  To process: {len(remaining)} (skipping {len(done_set)} already done)\n")
 
     # ── initialise Tavily searcher ────────────────────────────────────────────
@@ -242,7 +262,7 @@ def run_pipeline(
     # ── process each company ─────────────────────────────────────────────────
     start_time = time.time()
 
-    for idx, (company, sector) in enumerate(remaining, start=1):
+    for idx, (company, sector, country) in enumerate(remaining, start=1):
         total_remaining = len(remaining)
         print(f"  [{idx:3d}/{total_remaining}] {company}")
 
@@ -250,6 +270,22 @@ def run_pipeline(
         s1: StageOneResult = fetch_stage1(company)
         bd_str = "  ".join(f"{k}:{v:,}c" for k, v in s1.source_breakdown.items())
         print(f"          → Stage 1: {s1.char_count:,} chars  [{bd_str}]")
+
+        # 1b. Registry facts (GLEIF / SEC / Companies House — free, official).
+        #     Prepended so they reach BOTH the prescreener and the classifier:
+        #     an INACTIVE status or previous legal name should trigger Stage 2
+        #     even when the news headlines look quiet.
+        if getattr(config, "REGISTRY_ENABLED", False):
+            reg = registry_lookup(company, country)
+            if reg.context:
+                s1.full_context     = (reg.context + "\n\n" + s1.full_context)
+                s1.headline_text    = (reg.headline + "\n" + s1.headline_text).strip()
+                s1.sources          = list(dict.fromkeys(reg.sources + s1.sources))[:15]
+                s1.source_breakdown = {**reg.breakdown, **s1.source_breakdown}
+                s1.char_count      += len(reg.context)
+                flag_str = f"  flags: {', '.join(reg.flags)}" if reg.flags else ""
+                print(f"          → Registry: {len(reg.context):,} chars "
+                      f"[{'  '.join(reg.breakdown)}]{flag_str}")
 
         # 2. Prescreener — decide whether to spend Tavily credits
         ps: PrescreenResult = prescreener.check(company, s1.headline_text)
@@ -326,7 +362,7 @@ def run_pipeline(
 
     # ── reconstruct full results list in selected CSV order ──────────────────
     all_results: List[SignalResult] = []
-    for company, _sector in companies:
+    for company, _sector, _country in companies:
         if company in done_raw:
             all_results.append(_result_from_dict(done_raw[company]))
         else:

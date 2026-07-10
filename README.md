@@ -133,6 +133,31 @@ This is controlled by `FULLTEXT_ENABLED` in `config.py` (default `True`).
 If a Tavily key **is** configured, Tavily runs in addition to — not instead
 of — the free full-text sources.
 
+### 4b. Corporate registry layer (free, official, ground truth)
+
+At Stage 1, every company is also checked against corporate registries —
+legal facts that corroborate or refute news claims:
+
+- **GLEIF LEI API** (global, no key) — legal name + previous legal names,
+  entity status (ACTIVE/INACTIVE), successor entities, legal & HQ addresses.
+- **SEC submissions API** (US, no key) — `formerNames` with dates: an
+  authoritative rename detector. Finds delisted registrants too (companies
+  acquired or taken private — exactly the ones with signals).
+- **UK Companies House** (UK, free key) — company status (liquidation,
+  administration, dissolved), previous names with change dates. Set
+  `COMPANIES_HOUSE_API_KEY` to enable.
+
+Registry facts feed the prescreener as well as the classifier, so an
+INACTIVE entity or a previous legal name triggers Stage 2 even when news
+headlines are quiet. Controlled by `REGISTRY_ENABLED` (default `True`).
+
+Note on runtime: GLEIF allows 60 requests/minute, adding ~1 s per company.
+On a 5,000-company list that is ~85 minutes for the first run; interrupted
+runs resume from the checkpoint without repeating completed companies.
+Registry lookups use conservative name matching (country-filtered, token
+scoring) and always state the matched legal entity, so the classifier can
+discount subsidiary or fund mismatches.
+
 Recommended secret location:
 
 ```text

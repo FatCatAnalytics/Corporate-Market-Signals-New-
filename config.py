@@ -200,6 +200,25 @@ GUARDIAN_MAX_RESULTS: int = 5    # articles per company query
 GUARDIAN_DELAY: float = 0.2      # polite delay (seconds)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CORPORATE REGISTRY LOOKUPS  (free official APIs — ground-truth legal facts)
+# ─────────────────────────────────────────────────────────────────────────────
+# Runs at Stage 1 for every company. Registry facts (previous legal names,
+# entity status, successor entities, liquidation status) feed both the
+# prescreener and the classifier.
+REGISTRY_ENABLED: bool = _bool_env("REGISTRY_ENABLED", "True")
+
+# GLEIF LEI API — global, free, no key. Rate limit 60 req/min.
+# NOTE: at 60/min this adds ~1s per company; a 5,000-company run spends
+# ~85 min on GLEIF alone. Disable via REGISTRY_ENABLED=False for quick tests.
+GLEIF_DELAY: float = 1.05
+
+# UK Companies House — free key from
+# https://developer.company-information.service.gov.uk
+# Applies to UK-HQ companies only. Leave empty to skip Companies House.
+COMPANIES_HOUSE_API_KEY: str = os.environ.get("COMPANIES_HOUSE_API_KEY", "")
+COMPANIES_HOUSE_DELAY: float = 0.6   # 600 req / 5 min limit
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FREE FULL-TEXT ENRICHMENT  (official APIs only — no Tavily credits needed)
 # ─────────────────────────────────────────────────────────────────────────────
 # When the prescreener flags a company, fetch full text from free official

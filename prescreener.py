@@ -73,6 +73,12 @@ _SIGNAL_ROOTS = [
     r"liquidat",
     r"administration",  # UK/Aus equivalent of Chapter 11
     r"receivership",
+    # Registry facts (emitted by registry.py — GLEIF / SEC / Companies House)
+    r"prev.?name",
+    r"previous (legal )?name",
+    r"former name",
+    r"successor",
+    r"\binactive\b",
 ]
 
 _KW_PATTERN = re.compile(
