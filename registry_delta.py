@@ -122,19 +122,54 @@ def _resolve_columns(
 def _find_prev_name_columns(actual_cols: list[str]) -> list[tuple[str, Optional[str]]]:
     """
     GLEIF golden-copy CSVs carry other/previous names as numbered column
-    pairs (Entity.OtherEntityName.1 / Entity.OtherEntityName.1.Type …).
+    pairs (Entity.OtherEntityNames.OtherEntityName.1 / ….1.type …).
     Return [(name_col, type_col_or_None), …]; when a type column exists the
     caller filters for PREVIOUS_LEGAL_NAME, otherwise all values are kept.
+    Language columns (….xmllang) are metadata, not names — excluded.
     """
     pairs = []
     for col in actual_cols:
         s = _sig(col)
-        if ("otherentityname" in s or "othername" in s) and not s.endswith("type"):
+        if ("otherentityname" in s or "othername" in s) \
+                and not s.endswith("type") and not s.endswith("xmllang"):
             type_col = next(
                 (c for c in actual_cols if _sig(c) == s + "type"), None
             )
             pairs.append((col, type_col))
     return pairs
+
+
+def _find_successor_name_columns(actual_cols: list[str]) -> list[str]:
+    """Numbered successor-name columns (Entity.SuccessorEntity.N.SuccessorEntityName)."""
+    return [c for c in actual_cols
+            if "successorentityname" in _sig(c) and not _sig(c).endswith("xmllang")]
+
+
+def _find_event_columns(actual_cols: list[str]) -> list[tuple[str, Optional[str]]]:
+    """
+    Dated legal-entity events: (LegalEntityEventType, EffectiveDate) pairs
+    (Entity.LegalEntityEvents.LegalEntityEvent.N.LegalEntityEventType / …EffectiveDate).
+    These carry event dates the otherNames columns lack — a dated
+    CHANGE_LEGAL_NAME or MERGERS_AND_ACQUISITIONS entry lets the classifier
+    distinguish a recent rename from a decades-old one.
+    """
+    pairs = []
+    for col in actual_cols:
+        s = _sig(col)
+        if s.endswith("legalentityeventtype"):
+            date_col = next(
+                (c for c in actual_cols
+                 if _sig(c) == s[: -len("legalentityeventtype")]
+                 + "legalentityeventeffectivedate"), None)
+            pairs.append((col, date_col))
+    return pairs
+
+
+def _bt(col: str):
+    """Column reference with backticks — golden-copy loads keep literal dots
+    in column names, which Spark would otherwise parse as struct access."""
+    from pyspark.sql import functions as F
+    return F.col(f"`{col}`")
 
 
 def _norm_str(name: str) -> str:
@@ -172,6 +207,8 @@ def build_gleif_map(
     cols = _resolve_columns(df.columns, _L1_COLUMNS, _L1_REQUIRED,
                             columns, level1_table)
     prev_pairs = _find_prev_name_columns(df.columns)
+    succ_cols  = _find_successor_name_columns(df.columns)
+    event_pairs = _find_event_columns(df.columns)
 
     # ── target sets: LEI-keyed (exact) vs name-matched ───────────────────────
     lei_targets:  list[tuple] = []   # (company, lei, iso)
@@ -191,11 +228,17 @@ def build_gleif_map(
         return {}
 
     # ── project + normalise the GLEIF side ───────────────────────────────────
-    keep = [F.col(c).alias(k) for k, c in cols.items() if c]
+    keep = [_bt(c).alias(k) for k, c in cols.items() if c]
     for i, (ncol, tcol) in enumerate(prev_pairs):
-        keep.append(F.col(ncol).alias(f"_prev_{i}"))
+        keep.append(_bt(ncol).alias(f"_prev_{i}"))
         if tcol:
-            keep.append(F.col(tcol).alias(f"_prevtype_{i}"))
+            keep.append(_bt(tcol).alias(f"_prevtype_{i}"))
+    for i, scol in enumerate(succ_cols):
+        keep.append(_bt(scol).alias(f"_succ_{i}"))
+    for i, (ecol, dcol) in enumerate(event_pairs):
+        keep.append(_bt(ecol).alias(f"_evt_{i}"))
+        if dcol:
+            keep.append(_bt(dcol).alias(f"_evtdate_{i}"))
 
     base = df.select(*keep).where(F.col("legal_name").isNotNull())
 
@@ -212,7 +255,7 @@ def build_gleif_map(
                         "inner")
                     .collect())
         for r in lei_rows:
-            result[r["company"]] = (_row_to_rec(r, cols, prev_pairs), r["iso"] or None)
+            result[r["company"]] = (_row_to_rec(r, cols, prev_pairs, succ_cols, event_pairs), r["iso"] or None)
         misses = len(lei_targets) - len(lei_rows)
         if misses:
             print(f"  [REGISTRY DELTA] {misses} provided LEIs not found in "
@@ -266,7 +309,7 @@ def build_gleif_map(
                 best, best_score = r, score
         if best is None or best_score < _MATCH_THRESHOLD:
             continue
-        result[company] = (_row_to_rec(best, cols, prev_pairs),
+        result[company] = (_row_to_rec(best, cols, prev_pairs, succ_cols, event_pairs),
                            iso_by_company.get(company) or None)
 
     # ── Level 2: current ultimate parent (optional) ──────────────────────────
@@ -287,7 +330,8 @@ def build_gleif_map(
     return rendered
 
 
-def _row_to_rec(row, cols: dict, prev_pairs: list) -> dict:
+def _row_to_rec(row, cols: dict, prev_pairs: list,
+                succ_cols: list = (), event_pairs: list = ()) -> dict:
     """Convert a joined Spark Row into the shared GLEIF record dict."""
     fields = set(row.__fields__)
 
@@ -305,6 +349,17 @@ def _row_to_rec(row, cols: dict, prev_pairs: list) -> dict:
                 continue
         prev_names.append(val)
 
+    succ_names = [g(f"_succ_{i}") for i in range(len(succ_cols)) if g(f"_succ_{i}")]
+    if not succ_names and g("successor_name"):
+        succ_names = [g("successor_name")]
+
+    events = []
+    for i in range(len(event_pairs)):
+        etype = g(f"_evt_{i}")
+        if etype:
+            edate = str(g(f"_evtdate_{i}"))[:10]
+            events.append(f"{etype} ({edate})" if edate else etype)
+
     return {
         "lei":           g("lei"),
         "legal_name":    g("legal_name"),
@@ -312,7 +367,8 @@ def _row_to_rec(row, cols: dict, prev_pairs: list) -> dict:
         "reg_status":    g("reg_status"),
         "last_update":   str(g("last_update"))[:10],
         "prev_names":    prev_names,
-        "succ_names":    [g("successor_name")] if g("successor_name") else [],
+        "succ_names":    succ_names,
+        "events":        events,
         "exp_date":      g("exp_date"),
         "exp_reason":    g("exp_reason"),
         "legal_city":    g("legal_city", "?"),
@@ -335,10 +391,10 @@ def _attach_parents(spark, result: dict, level1_table: str,
 
     leis = [rec["lei"] for rec, _iso in result.values() if rec["lei"]]
     rel  = (rr.select(
-                F.col(l2_cols["child_lei"]).alias("child"),
-                F.col(l2_cols["parent_lei"]).alias("parent"),
-                F.col(l2_cols["rel_type"]).alias("rtype"),
-                *( [F.col(l2_cols["rel_status"]).alias("rstatus")]
+                _bt(l2_cols["child_lei"]).alias("child"),
+                _bt(l2_cols["parent_lei"]).alias("parent"),
+                _bt(l2_cols["rel_type"]).alias("rtype"),
+                *( [_bt(l2_cols["rel_status"]).alias("rstatus")]
                    if l2_cols.get("rel_status") else [] ))
               .where(F.col("child").isin(leis))
               .where(F.col("rtype") == "IS_ULTIMATELY_CONSOLIDATED_BY"))
@@ -346,8 +402,8 @@ def _attach_parents(spark, result: dict, level1_table: str,
         rel = rel.where(F.col("rstatus") == "ACTIVE")
 
     l1 = spark.table(level1_table).select(
-        F.col(l1_cols["lei"]).alias("parent"),
-        F.col(l1_cols["legal_name"]).alias("parent_name"),
+        _bt(l1_cols["lei"]).alias("parent"),
+        _bt(l1_cols["legal_name"]).alias("parent_name"),
     )
     parents = {r["child"]: r["parent_name"]
                for r in rel.join(l1, "parent", "left").collect()}

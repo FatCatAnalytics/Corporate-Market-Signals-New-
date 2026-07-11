@@ -296,6 +296,10 @@ def format_gleif_record(
     if succ_names:
         lines.append(f"SUCCESSOR ENTITY: {'; '.join(succ_names)}")
         flags.append("gleif_successor")
+    events = [e for e in (rec.get("events") or []) if e]
+    if events:
+        lines.append(f"Legal entity events (dated): {'; '.join(events[:5])}")
+        flags.append("gleif_events")
     if rec.get("parent_name"):
         lines.append(f"Ultimate parent: {rec['parent_name']}")
     lines.append(f"HQ: {rec.get('hq_city','?')}, {rec.get('hq_country','?')} | "
