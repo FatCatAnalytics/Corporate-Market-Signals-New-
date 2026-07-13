@@ -155,19 +155,45 @@ _SYSTEM = (
     "Respond ONLY with valid JSON — no commentary, no markdown fences."
 )
 
+_SIGNAL_DEFS = """\
+SIGNAL DEFINITIONS — route each distinct event to exactly ONE signal, the most
+specific one that fits. Work down this list in order; the FIRST match wins.
+
+- bankruptcy       : bankruptcy, administration, insolvency, or liquidation
+                     filing (any jurisdiction's equivalent).
+- shutdown         : entity fully wound down / dissolved / ceased to exist
+                     with no successor operations.
+- ma_spinoff       : any merger, acquisition, takeover, spinoff, or major
+                     divestiture in which the company is EITHER the acquirer
+                     OR the target/divested party. The company buying another
+                     company IS an ma_spinoff signal. Announced or pending
+                     deals count — note the deal status in the detail.
+                     An acquisition, merger or divestiture is NEVER an
+                     operational_change, even when framed as "strategy" or
+                     "portfolio restructuring around a deal".
+- renaming         : legal name change or major corporate rebrand (old name →
+                     new name). If a rename accompanies a deal, report the
+                     rename here AND the deal under ma_spinoff — that is the
+                     one case where a story yields two signals, because it is
+                     two events.
+- hq_change        : HQ relocation or legal redomicile to another country or
+                     state. Not branch/office openings or closings.
+- sector_change    : the company's PRIMARY industry or business focus changed.
+- operational_change: ONLY material operational events: a named restructuring
+                     programme, significant site/plant closures, or workforce
+                     reductions (>5% of staff or thousands of jobs).
+                     NOT operational_change: executive hires or departures,
+                     earnings results, guidance, product launches, store
+                     openings, partnerships, buybacks, dividends, ordinary
+                     capex, or generic "transformation" talk without concrete
+                     closures/cuts. When in doubt, leave it out.
+"""
+
 _PASS1 = """\
 Read the text about "{company}" and identify which corporate change signals are present.
 Only consider corporate changes inside this time window: {date_range}.
 
-SIGNALS:
-- sector_change    : company changed its primary industry or sector
-- hq_change        : HQ relocation OR legal redomicile to another country/state
-- ma_spinoff       : merger, acquisition, takeover, spinoff, or major divestiture
-- renaming         : legal name change or major brand rename
-- operational_change: major restructuring, significant site closure, or workforce cut >5%
-- shutdown         : entity fully wound down / dissolved / all capital returned
-- bankruptcy       : bankruptcy, administration, insolvency, or liquidation filing
-
+""" + _SIGNAL_DEFS + """
 TEXT:
 {context}
 
@@ -193,6 +219,11 @@ Respond with JSON only:
 }}
 Rules:
 - confirmed=false if evidence is weak, ambiguous, or outside the time window
+- ma_spinoff: confirm whether the company is the ACQUIRER or the TARGET —
+  both count; say which in the detail, plus deal status (announced/pending/completed)
+- operational_change: confirm ONLY named restructuring programmes, significant
+  site closures, or workforce cuts (>5% / thousands). Executive appointments,
+  earnings, products, partnerships are NOT operational changes → confirmed=false
 - is_shutdown=true ONLY if entity fully ceased (wound down, dissolved, absorbed with no brand successor)
 - confidence 5=multiple corroborating sources with dates, 3=single clear source, 1=inferred"""
 
@@ -215,6 +246,7 @@ _SINGLE_PASS = """\
 Analyze the following content about "{company}" and extract all corporate change signals
 from {date_range}.
 
+""" + _SIGNAL_DEFS + """
 CONTENT:
 {context}
 
@@ -223,7 +255,7 @@ Return a JSON object with EXACTLY these fields:
   "sector_change": true/false, "sector_detail": "one sentence or empty",
   "hq_change": true/false, "hq_detail": "FROM → TO with date, or empty",
   "hq_region": "USA sub-region or country if hq_change, else empty",
-  "ma_spinoff": true/false, "ma_detail": "one sentence or empty",
+  "ma_spinoff": true/false, "ma_detail": "one sentence: acquirer/target roles, deal status, date — or empty",
   "renaming": true/false, "rename_detail": "old name → new name + date, or empty",
   "operational_change": true/false, "ops_detail": "one sentence or empty",
   "shutdown": true/false, "shutdown_detail": "one sentence or empty",
