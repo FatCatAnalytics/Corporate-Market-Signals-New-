@@ -238,16 +238,20 @@ Only confirm the signal if it happened inside this time window: {date_range}.
 TEXT:
 {context}
 
-Respond with JSON only:
+Respond with JSON only — fill the fields IN ORDER (evidence first, verdict
+after it; this order is deliberate):
 {{
+  "evidence": "quote the single strongest supporting line from the text, including its date and source tag",
+  "evidence_date": "YYYY-MM-DD or best approximation from the quoted line, or empty",
+  "in_window": true/false,
   "confirmed": true/false,
-  "detail": "one sentence: what happened, when, who was involved — cite a date if present",
+  "detail": "one sentence: what happened, when, who was involved — cite the date",
   "hq_region": "if hq_change: USA West | USA New York | USA Midwest | USA South | USA Boston | USA Northeast — or country name. Else empty string.",
   "is_shutdown": true/false,
   "confidence": 1-5
 }}
 Rules:
-- confirmed=false if evidence is weak, ambiguous, or outside the time window
+- confirmed=true requires the evidence quoted above with a date inside the window
 - A dated news headline from a named source that identifies the parties and
   the event IS sufficient evidence (confidence 3) — full article text is not
   required. Registry facts ([GLEIF REGISTRY]/[SEC REGISTRY] lines) are
