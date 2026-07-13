@@ -630,6 +630,70 @@ def fetch_stage2(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tavily targeted fetch — thin-evidence gate (raw content, budget-capped)
+# ─────────────────────────────────────────────────────────────────────────────
+def fetch_tavily_targeted(
+    company:       str,
+    seen_urls:     set[str],
+    tavily_client: "TavilyClient",
+    max_queries:   int,
+) -> tuple[list[str], list[str], int]:
+    """
+    Credit-efficient Tavily fetch for companies whose FREE evidence came
+    back thin (typically non-US/private companies with headline-only news).
+
+    Differences from the legacy fetch_stage2:
+      - 1-2 broad queries instead of 5 narrow ones
+      - include_raw_content=True: actual article text, not 800-char
+        snippets — the full-text depth the free stack couldn't provide
+      - caller passes max_queries from a process-wide budget; returns the
+        number actually spent so unused reservations can be refunded
+
+    Returns (sections, urls, queries_spent).
+    """
+    c = _clean_name(company)
+    years = _year_terms()
+    queries = [
+        f'"{c}" merger OR acquisition OR takeover OR divestiture OR spinoff {years}',
+        f'"{c}" renamed OR rebranded OR bankruptcy OR liquidation OR restructuring OR relocated {years}',
+    ][:max(0, max_queries)]
+
+    raw_cap  = getattr(config, "TAVILY_RAW_CHARS_PER_RESULT", 3000)
+    sections: list[str] = []
+    urls:     list[str] = []
+    spent = 0
+
+    for query in queries:
+        try:
+            resp = tavily_client.search(
+                query               = query,
+                max_results         = min(config.TAVILY_MAX_RESULTS, 3),
+                search_depth        = config.TAVILY_SEARCH_DEPTH,
+                include_raw_content = True,
+            )
+            spent += 1
+        except Exception as e:
+            print(f"    [Tavily targeted error] {company}: {e}")
+            break
+
+        for r in resp.get("results", []):
+            url = r.get("url", "")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            title = (r.get("title") or "").strip()
+            body  = (r.get("raw_content") or r.get("content") or "").strip()
+            if not body:
+                continue
+            sections.append(f"[TAVILY FULL TEXT] {title}\n{url}\n{_truncate(body, raw_cap)}")
+            urls.append(url)
+
+        time.sleep(0.3)
+
+    return sections, urls, spent
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Convenience wrapper — used by pipeline.py
 # ─────────────────────────────────────────────────────────────────────────────
 class MultiSourceFetcher:

@@ -58,6 +58,17 @@ TAVILY_API_KEY: str = os.environ.get("TAVILY_API_KEY", "tvly-YOUR_KEY_HERE")
 TAVILY_MAX_RESULTS: int = 5       # results per query
 TAVILY_SEARCH_DEPTH: str = "advanced"   # "basic" (faster) or "advanced" (better)
 
+# ─── Thin-evidence gating (how Tavily credits are actually spent) ───────────
+# Tavily fires ONLY for companies that (a) passed the prescreener AND
+# (b) got thin free full-text evidence — below TAVILY_THIN_THRESHOLD chars
+# from SEC filings / Guardian bodies / Wikipedia. US public companies with
+# their own filings never spend a credit; the budget goes to the
+# non-US/private companies where the free stack is weakest.
+TAVILY_BUDGET: int = _int_env("TAVILY_BUDGET", 2000)   # max queries per run; 0 = never call Tavily
+TAVILY_THIN_THRESHOLD: int = _int_env("TAVILY_THIN_THRESHOLD", 3000)
+TAVILY_QUERIES_PER_COMPANY: int = _int_env("TAVILY_QUERIES_PER_COMPANY", 2)
+TAVILY_RAW_CHARS_PER_RESULT: int = 3000   # raw article text kept per result
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MODEL BACKEND SELECTOR
 # ─────────────────────────────────────────────────────────────────────────────

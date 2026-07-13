@@ -52,7 +52,7 @@ from dataclasses import asdict
 from typing import List, Optional, Tuple
 
 import config
-from search import fetch_stage1, fetch_stage2, FetchResult, StageOneResult
+from search import fetch_stage1, fetch_tavily_targeted, FetchResult, StageOneResult
 from fulltext import enrich_with_fulltext, stage1_to_fetchresult
 from registry import lookup as registry_lookup
 from classifier import Classifier, SignalResult, make_classifier
@@ -196,6 +196,31 @@ def _result_from_dict(d: dict) -> SignalResult:
     })
 
 
+class _TavilyBudget:
+    """Thread-safe credit budget shared by all workers. Hard stop: once
+    spent == total, take() returns 0 and the run continues free-only."""
+
+    def __init__(self, total: int):
+        self._lock = threading.Lock()
+        self.total = max(0, int(total))
+        self.spent = 0
+
+    def take(self, k: int) -> int:
+        with self._lock:
+            k = max(0, min(k, self.total - self.spent))
+            self.spent += k
+            return k
+
+    def refund(self, k: int) -> None:
+        with self._lock:
+            self.spent = max(0, self.spent - k)
+
+    @property
+    def remaining(self) -> int:
+        with self._lock:
+            return self.total - self.spent
+
+
 def _normalise_max_companies(max_companies: Optional[int]) -> int:
     if max_companies is None:
         return max(0, getattr(config, "DEFAULT_MAX_COMPANIES", 0))
@@ -277,10 +302,19 @@ def run_pipeline(
     else:
         print(
             "  [INFO] Tavily key not set or unavailable.\n"
-            "  Stage 2 will use FREE full-text sources instead\n"
+            "  Stage 2 will use FREE full-text sources only\n"
             "  (SEC filing documents, Guardian article bodies, Wikipedia).\n"
-            "  Set TAVILY_API_KEY in config.py to add Tavily on top."
+            "  Set TAVILY_API_KEY to add targeted raw-content fetches for\n"
+            "  thin-evidence companies (budget-capped by TAVILY_BUDGET)."
         )
+
+    # Credit budget shared across all workers (0 when no client → never used)
+    tavily_budget = _TavilyBudget(
+        getattr(config, "TAVILY_BUDGET", 0) if tavily_client is not None else 0)
+    if tavily_client is not None:
+        print(f"  Tavily: targeted thin-evidence mode — budget {tavily_budget.total} queries, "
+              f"thin threshold {getattr(config, 'TAVILY_THIN_THRESHOLD', 3000):,} chars, "
+              f"{getattr(config, 'TAVILY_QUERIES_PER_COMPANY', 2)} queries/company")
 
     # ── initialise prescreener + classifier (stateless — shared by workers) ──
     prescreener: Prescreener = Prescreener()
@@ -332,16 +366,12 @@ def run_pipeline(
         }
 
         if ps.passed:
-            if tavily_client is not None:
-                out.append(f"          → Prescreener PASS (score={ps.score}: {ps.reason}) — running Stage 2 (Tavily)")
-                fetch: FetchResult = fetch_stage2(company, s1, tavily_client)
-                out.append(f"          → Stage 2: {fetch.char_count:,} chars total")
-            else:
-                out.append(f"          → Prescreener PASS (score={ps.score}: {ps.reason}) — Tavily not configured")
-                fetch = stage1_to_fetchresult(s1)
+            out.append(f"          → Prescreener PASS (score={ps.score}: {ps.reason})")
+            fetch = stage1_to_fetchresult(s1)
 
             # Free full-text enrichment (official APIs — no credits used).
-            # Runs for every prescreener-passed company, with or without Tavily.
+            # Runs for every prescreener-passed company.
+            ft_chars = 0
             if getattr(config, "FULLTEXT_ENABLED", False):
                 fetch = enrich_with_fulltext(company, fetch)
                 ft_chars = sum(v for k, v in fetch.source_breakdown.items()
@@ -353,6 +383,40 @@ def run_pipeline(
                     out.append(f"          → Full text (free): +{ft_chars:,} chars  [{ft_bd}]")
                 else:
                     out.append(f"          → Full text (free): no documents found")
+
+            # Tavily thin-evidence gate: spend credits ONLY where the free
+            # stack came back thin. Raw article content, budget-capped,
+            # hard stop; the run continues free-only when credits run out.
+            if (tavily_client is not None
+                    and ft_chars < getattr(config, "TAVILY_THIN_THRESHOLD", 3000)):
+                allowed = tavily_budget.take(
+                    getattr(config, "TAVILY_QUERIES_PER_COMPANY", 2))
+                if allowed > 0:
+                    secs, urls, used = fetch_tavily_targeted(
+                        company, set(fetch.sources), tavily_client, allowed)
+                    if used < allowed:
+                        tavily_budget.refund(allowed - used)
+                    if secs:
+                        tav_ctx   = "\n\n".join(secs)
+                        max_chars = config.CONTEXT_CHUNK_SIZE * config.MAX_CONTEXT_CHUNKS
+                        reserve   = max(0, min(len(tav_ctx) + 44, max_chars - 6000))
+                        base      = fetch.context[: max_chars - reserve]
+                        fetch = FetchResult(
+                            company          = company,
+                            context          = (base + "\n\n=== TAVILY TARGETED (RAW CONTENT) ===\n"
+                                                + tav_ctx)[:max_chars],
+                            sources          = list(dict.fromkeys(fetch.sources + urls))[:15],
+                            char_count       = fetch.char_count + len(tav_ctx),
+                            source_breakdown = {**fetch.source_breakdown,
+                                                "tavily_raw": len(tav_ctx)},
+                        )
+                        out.append(f"          → Tavily (thin evidence): +{len(tav_ctx):,} chars, "
+                                   f"{used} credit(s), {tavily_budget.remaining} left")
+                    else:
+                        out.append(f"          → Tavily (thin evidence): no results, "
+                                   f"{used} credit(s) spent")
+                else:
+                    out.append("          → Tavily budget exhausted — free evidence only")
         else:
             out.append(f"          → Prescreener SKIP ({ps.stage}, score={ps.score}: {ps.reason})")
             fetch = FetchResult(
@@ -463,7 +527,8 @@ def run_pipeline(
         triggered  = sum(1 for r in prescreen_log if r["passed"])
         print(f"  Prescreener: {triggered}/{len(prescreen_log)} triggered Stage 2")
         if tavily_client is not None:
-            print(f"  Tavily calls used: ~{triggered * 5} of 1,000 free/month")
+            print(f"  Tavily credits spent: {tavily_budget.spent} of {tavily_budget.total} budget "
+                  f"(thin-evidence companies only)")
         else:
             print(f"  Tavily not used — Stage 2 served by free full-text sources")
         print(f"  Prescreener log: {log_path}")
