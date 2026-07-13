@@ -358,11 +358,16 @@ def run_pipeline(
         # 2. Prescreener — decide whether to run Stage 2 deep evidence
         ps: PrescreenResult = prescreener.check(company, s1.headline_text)
         ps_entry = {
-            "company": company,
-            "passed":  ps.passed,
-            "stage":   ps.stage,
-            "score":   ps.score,
-            "reason":  ps.reason,
+            "company":        company,
+            "passed":         ps.passed,
+            "stage":          ps.stage,
+            "score":          ps.score,
+            "reason":         ps.reason,
+            # Filled below for passed companies — lets a free-only run
+            # count its thin-evidence population and size a Tavily budget
+            # from data before buying credits.
+            "fulltext_chars": "",
+            "thin_evidence":  "",
         }
 
         if ps.passed:
@@ -384,11 +389,17 @@ def run_pipeline(
                 else:
                     out.append(f"          → Full text (free): no documents found")
 
+            # Record evidence depth for every passed company — with or
+            # without a Tavily key — so the prescreen log answers "how many
+            # thin-evidence companies would spend credits?"
+            is_thin = ft_chars < getattr(config, "TAVILY_THIN_THRESHOLD", 3000)
+            ps_entry["fulltext_chars"] = ft_chars
+            ps_entry["thin_evidence"]  = is_thin
+
             # Tavily thin-evidence gate: spend credits ONLY where the free
             # stack came back thin. Raw article content, budget-capped,
             # hard stop; the run continues free-only when credits run out.
-            if (tavily_client is not None
-                    and ft_chars < getattr(config, "TAVILY_THIN_THRESHOLD", 3000)):
+            if tavily_client is not None and is_thin:
                 allowed = tavily_budget.take(
                     getattr(config, "TAVILY_QUERIES_PER_COMPANY", 2))
                 if allowed > 0:
@@ -521,11 +532,17 @@ def run_pipeline(
         import csv
         log_path = os.path.splitext(output_xlsx)[0] + "_prescreen_log.csv"
         with open(log_path, "w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=["company","passed","stage","score","reason"])
+            writer = csv.DictWriter(fh, fieldnames=["company","passed","stage","score","reason",
+                                                    "fulltext_chars","thin_evidence"])
             writer.writeheader()
             writer.writerows(prescreen_log)
         triggered  = sum(1 for r in prescreen_log if r["passed"])
         print(f"  Prescreener: {triggered}/{len(prescreen_log)} triggered Stage 2")
+        thin = sum(1 for r in prescreen_log if r.get("thin_evidence") is True)
+        est  = thin * getattr(config, "TAVILY_QUERIES_PER_COMPANY", 2)
+        print(f"  Thin-evidence companies: {thin}/{triggered} passed "
+              f"(a Tavily-enabled run would spend ~{est} credits at "
+              f"{getattr(config, 'TAVILY_QUERIES_PER_COMPANY', 2)}/company)")
         if tavily_client is not None:
             print(f"  Tavily credits spent: {tavily_budget.spent} of {tavily_budget.total} budget "
                   f"(thin-evidence companies only)")
