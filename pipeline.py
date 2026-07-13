@@ -46,6 +46,7 @@ import importlib
 import json
 import os
 import sys
+import threading
 import time
 from dataclasses import asdict
 from typing import List, Optional, Tuple
@@ -281,24 +282,28 @@ def run_pipeline(
             "  Set TAVILY_API_KEY in config.py to add Tavily on top."
         )
 
-    # ── initialise prescreener + classifier ───────────────────────────────────
+    # ── initialise prescreener + classifier (stateless — shared by workers) ──
     prescreener: Prescreener = Prescreener()
     classifier:  Classifier  = make_classifier()
 
     # ── prescreener log ───────────────────────────────────────────────────────
     prescreen_log: list[dict] = []
 
-    # ── process each company ─────────────────────────────────────────────────
-    start_time = time.time()
-
-    for idx, (company, sector, country, lei) in enumerate(remaining, start=1):
-        total_remaining = len(remaining)
-        print(f"  [{idx:3d}/{total_remaining}] {company}")
+    # ── per-company worker ────────────────────────────────────────────────────
+    def _process_company(company: str, sector: str, country: str, lei: str,
+                         ) -> tuple[SignalResult, dict, list[str]]:
+        """
+        Full per-company flow. Returns (result, prescreen_entry, log_lines).
+        Pure function of its inputs + shared stateless clients — safe to run
+        from multiple threads. Console output is buffered into log_lines so
+        parallel workers don't interleave their lines.
+        """
+        out: list[str] = []
 
         # 1. Stage 1 — free sources (always runs)
         s1: StageOneResult = fetch_stage1(company)
         bd_str = "  ".join(f"{k}:{v:,}c" for k, v in s1.source_breakdown.items())
-        print(f"          → Stage 1: {s1.char_count:,} chars  [{bd_str}]")
+        out.append(f"          → Stage 1: {s1.char_count:,} chars  [{bd_str}]")
 
         # 1b. Registry facts (GLEIF / SEC / Companies House — free, official).
         #     Prepended so they reach BOTH the prescreener and the classifier:
@@ -313,26 +318,26 @@ def run_pipeline(
                 s1.source_breakdown = {**reg.breakdown, **s1.source_breakdown}
                 s1.char_count      += len(reg.context)
                 flag_str = f"  flags: {', '.join(reg.flags)}" if reg.flags else ""
-                print(f"          → Registry: {len(reg.context):,} chars "
-                      f"[{'  '.join(reg.breakdown)}]{flag_str}")
+                out.append(f"          → Registry: {len(reg.context):,} chars "
+                           f"[{'  '.join(reg.breakdown)}]{flag_str}")
 
-        # 2. Prescreener — decide whether to spend Tavily credits
+        # 2. Prescreener — decide whether to run Stage 2 deep evidence
         ps: PrescreenResult = prescreener.check(company, s1.headline_text)
-        prescreen_log.append({
+        ps_entry = {
             "company": company,
             "passed":  ps.passed,
             "stage":   ps.stage,
             "score":   ps.score,
             "reason":  ps.reason,
-        })
+        }
 
         if ps.passed:
             if tavily_client is not None:
-                print(f"          → Prescreener PASS (score={ps.score}: {ps.reason}) — running Stage 2 (Tavily)")
+                out.append(f"          → Prescreener PASS (score={ps.score}: {ps.reason}) — running Stage 2 (Tavily)")
                 fetch: FetchResult = fetch_stage2(company, s1, tavily_client)
-                print(f"          → Stage 2: {fetch.char_count:,} chars total")
+                out.append(f"          → Stage 2: {fetch.char_count:,} chars total")
             else:
-                print(f"          → Prescreener PASS (score={ps.score}: {ps.reason}) — Tavily not configured")
+                out.append(f"          → Prescreener PASS (score={ps.score}: {ps.reason}) — Tavily not configured")
                 fetch = stage1_to_fetchresult(s1)
 
             # Free full-text enrichment (official APIs — no credits used).
@@ -345,11 +350,11 @@ def run_pipeline(
                     ft_bd = "  ".join(f"{k}:{v:,}c"
                                       for k, v in fetch.source_breakdown.items()
                                       if k.endswith("_fulltext"))
-                    print(f"          → Full text (free): +{ft_chars:,} chars  [{ft_bd}]")
+                    out.append(f"          → Full text (free): +{ft_chars:,} chars  [{ft_bd}]")
                 else:
-                    print(f"          → Full text (free): no documents found")
+                    out.append(f"          → Full text (free): no documents found")
         else:
-            print(f"          → Prescreener SKIP ({ps.stage}, score={ps.score}: {ps.reason})")
+            out.append(f"          → Prescreener SKIP ({ps.stage}, score={ps.score}: {ps.reason})")
             fetch = FetchResult(
                 company          = company,
                 context          = s1.full_context,
@@ -365,7 +370,7 @@ def run_pipeline(
             sources = fetch.sources,
         )
 
-        # 4. Print brief status
+        # 4. Brief status
         if result.total_signals > 0:
             flags = []
             if result.sector_change:      flags.append("Sector")
@@ -375,17 +380,58 @@ def run_pipeline(
             if result.operational_change: flags.append("Ops")
             if result.shutdown:           flags.append("SHUTDOWN")
             if result.bankruptcy:         flags.append("Bankruptcy")
-            print(f"          → {result.total_signals} signal(s): {', '.join(flags)}")
+            out.append(f"          → {result.total_signals} signal(s): {', '.join(flags)}")
         else:
-            print(f"          → no signals")
+            out.append(f"          → no signals")
 
-        # 5. Persist to checkpoint
-        done_raw[company] = asdict(result)
-        _save_checkpoint(output_xlsx, done_raw)
+        return result, ps_entry, out
 
-        # 6. Rate-limit between companies
-        if idx < total_remaining:
-            time.sleep(config.INTER_COMPANY_DELAY)
+    # ── process companies (parallel when PIPELINE_MAX_WORKERS > 1) ──────────
+    start_time      = time.time()
+    total_remaining = len(remaining)
+    max_workers     = max(1, int(getattr(config, "PIPELINE_MAX_WORKERS", 1)))
+    state_lock      = threading.Lock()   # guards done_raw, prescreen_log, counter
+    completed       = [0]
+
+    def _finish(company: str, result: SignalResult, ps_entry: dict,
+                out: list[str]) -> None:
+        """Record one company's outcome. Called under no lock; takes it."""
+        with state_lock:
+            completed[0] += 1
+            idx = completed[0]
+            prescreen_log.append(ps_entry)
+            done_raw[company] = asdict(result)
+            _save_checkpoint(output_xlsx, done_raw)
+            print("\n".join([f"  [{idx:3d}/{total_remaining}] {company}"] + out))
+
+    if max_workers == 1 or len(remaining) <= 1:
+        for company, sector, country, lei in remaining:
+            result, ps_entry, out = _process_company(company, sector, country, lei)
+            _finish(company, result, ps_entry, out)
+            if completed[0] < total_remaining:
+                time.sleep(config.INTER_COMPANY_DELAY)
+    else:
+        print(f"  Parallel mode: {max_workers} workers "
+              f"(per-host rate limits shared across workers)\n")
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=max_workers,
+                                thread_name_prefix="company") as pool:
+            futures = {
+                pool.submit(_process_company, company, sector, country, lei):
+                company
+                for company, sector, country, lei in remaining
+            }
+            for fut in as_completed(futures):
+                company = futures[fut]
+                try:
+                    result, ps_entry, out = fut.result()
+                except Exception as e:
+                    result   = SignalResult(company=company,
+                                            summary=f"[ERROR: {e}]")
+                    ps_entry = {"company": company, "passed": False,
+                                "stage": "error", "score": 0, "reason": str(e)[:80]}
+                    out      = [f"          → ERROR: {e}"]
+                _finish(company, result, ps_entry, out)
 
     elapsed = time.time() - start_time
 

@@ -40,6 +40,7 @@ from typing import Optional
 import requests
 
 import config
+from ratelimit import acquire_for_url
 from search import FetchResult, StageOneResult, _clean_name
 
 _SESSION = requests.Session()
@@ -74,6 +75,7 @@ def _strip_html(raw: str) -> str:
 def _get(url: str, timeout: int = 15, **kwargs) -> Optional[requests.Response]:
     for attempt in range(2):
         try:
+            acquire_for_url(url)   # process-wide, per-host, thread-safe
             r = _SESSION.get(url, timeout=timeout, **kwargs)
             if r.status_code == 200:
                 return r

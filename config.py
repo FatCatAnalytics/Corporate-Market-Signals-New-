@@ -166,8 +166,16 @@ USE_IMPROVED_CLASSIFIER: bool = True
 CONTEXT_CHUNK_SIZE: int = 3_000
 MAX_CONTEXT_CHUNKS: int = 5       # = 15,000 total chars (was 3 → 9,000)
 
-# Seconds to wait between companies (avoids Tavily rate limits)
+# Seconds to wait between companies (sequential mode only)
 INTER_COMPANY_DELAY: float = 1.0
+
+# Parallel workers for the per-company loop. The loop is I/O-bound (news
+# APIs + model endpoints), so threads give near-linear speedup until shared
+# rate limits saturate. Per-host limits are enforced process-wide by
+# ratelimit.py regardless of worker count. Set 1 for the old sequential
+# behaviour. 8 is a sane default; measure before going higher — the model
+# serving endpoint's concurrency cap is usually the real ceiling.
+PIPELINE_MAX_WORKERS: int = _int_env("PIPELINE_MAX_WORKERS", 8)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BRAVE SEARCH API  (optional — $5 monthly credit ~1,000 queries)

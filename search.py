@@ -34,6 +34,7 @@ from typing import Optional
 import requests
 
 import config
+from ratelimit import acquire_for_url
 
 try:
     from tavily import TavilyClient
@@ -99,6 +100,7 @@ _SESSION.headers.update({
 def _get(url: str, timeout: int = 12, **kwargs) -> Optional[requests.Response]:
     for attempt in range(2):
         try:
+            acquire_for_url(url)   # process-wide, per-host, thread-safe
             r = _SESSION.get(url, timeout=timeout, **kwargs)
             if r.status_code == 200:
                 return r
@@ -258,6 +260,7 @@ def _fetch_gdelt(company: str, seen_urls: set[str], max_items: int = 10) -> tupl
     }
 
     try:
+        acquire_for_url(_GDELT_URL)
         r = _SESSION.get(_GDELT_URL, params=params, timeout=12)
         if r.status_code != 200:
             return "", []
@@ -318,6 +321,7 @@ def _fetch_guardian(company: str, seen_urls: set[str], max_items: int = 5) -> tu
     }
 
     try:
+        acquire_for_url(_GUARDIAN_URL)
         r = _SESSION.get(_GUARDIAN_URL, params=params, timeout=10)
         if r.status_code != 200:
             return "", []

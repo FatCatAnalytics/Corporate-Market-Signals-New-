@@ -47,6 +47,7 @@ from typing import Optional
 import requests
 
 import config
+from ratelimit import acquire_for_url
 
 _SESSION = requests.Session()
 _SESSION.headers.update({
@@ -164,6 +165,7 @@ def _rate_limit(last: list[float], min_interval: float) -> None:
 def _get(url: str, timeout: int = 15, **kwargs) -> Optional[requests.Response]:
     for attempt in range(2):
         try:
+            acquire_for_url(url)   # process-wide, per-host, thread-safe
             r = _SESSION.get(url, timeout=timeout, **kwargs)
             if r.status_code == 200:
                 return r
@@ -194,8 +196,6 @@ def lookup_gleif(
     When the input list supplies an LEI, the record is fetched directly —
     deterministic, no fuzzy-match risk. Name search is the fallback.
     """
-    _rate_limit(_gleif_last, getattr(config, "GLEIF_DELAY", 1.05))
-
     best, best_score = None, 0.0
 
     if lei:
@@ -330,23 +330,30 @@ _SEC_TICKERS_URL     = "https://www.sec.gov/files/company_tickers.json"
 _SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
 _sec_last            = [0.0]
 _sec_name_to_cik: Optional[dict[tuple[str, ...], int]] = None
+_sec_map_lock = __import__("threading").Lock()
 
 
 def _load_sec_ticker_map() -> dict[tuple[str, ...], int]:
-    """Download the SEC ticker file once and index by normalised name."""
+    """Download the SEC ticker file once and index by normalised name.
+    Thread-safe: with the pipeline loop parallelised, several workers can
+    race to trigger the first load."""
     global _sec_name_to_cik
     if _sec_name_to_cik is not None:
         return _sec_name_to_cik
-    _sec_name_to_cik = {}
-    r = _get(_SEC_TICKERS_URL, timeout=20)
-    if r:
-        try:
-            for item in r.json().values():
-                toks = _norm_tokens(item.get("title", ""))
-                if toks and toks not in _sec_name_to_cik:
-                    _sec_name_to_cik[toks] = int(item.get("cik_str", 0))
-        except Exception:
-            pass
+    with _sec_map_lock:
+        if _sec_name_to_cik is not None:   # double-checked
+            return _sec_name_to_cik
+        mapping: dict[tuple[str, ...], int] = {}
+        r = _get(_SEC_TICKERS_URL, timeout=20)
+        if r:
+            try:
+                for item in r.json().values():
+                    toks = _norm_tokens(item.get("title", ""))
+                    if toks and toks not in mapping:
+                        mapping[toks] = int(item.get("cik_str", 0))
+            except Exception:
+                pass
+        _sec_name_to_cik = mapping
     return _sec_name_to_cik
 
 
@@ -365,7 +372,6 @@ def _sec_cik_by_fts(company: str) -> Optional[int]:
     (The legacy browse-edgar atom API is broken for multi-match results —
     it emits Perl 'ARRAY(0x..)' artifacts instead of company names.)
     """
-    _rate_limit(_sec_last, 0.15)
     r = _get(_SEC_FTS_URL, params={"q": f'"{company}"'})
     if not r:
         return None
@@ -399,7 +405,6 @@ def lookup_sec(company: str) -> tuple[str, str, list[str], list[str]]:
     if not cik:
         return "", "", [], []
 
-    _rate_limit(_sec_last, 0.15)
     r = _get(_SEC_SUBMISSIONS_URL.format(cik=cik))
     if not r:
         return "", "", [], []
@@ -451,7 +456,6 @@ def lookup_companies_house(company: str) -> tuple[str, str, list[str], list[str]
     if not api_key:
         return "", "", [], []
 
-    _rate_limit(_ch_last, getattr(config, "COMPANIES_HOUSE_DELAY", 0.6))
     r = _get(_CH_SEARCH_URL, params={"q": company, "items_per_page": 5},
              auth=(api_key, ""))
     if not r:
@@ -470,7 +474,6 @@ def lookup_companies_house(company: str) -> tuple[str, str, list[str], list[str]
         return "", "", [], []
 
     number = best.get("company_number", "")
-    _rate_limit(_ch_last, getattr(config, "COMPANIES_HOUSE_DELAY", 0.6))
     r = _get(_CH_COMPANY_URL.format(number=number), auth=(api_key, ""))
     if not r:
         return "", "", [], []
