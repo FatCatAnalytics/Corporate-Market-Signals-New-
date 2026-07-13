@@ -21,12 +21,23 @@ Supported endpoints (set in config.py):
 from __future__ import annotations
 
 import os
+import random
+import threading
 import time
 from typing import Optional
 
 import requests
 
 import config
+
+
+# Process-wide cap on CONCURRENT model-endpoint calls, shared by every
+# client instance and every pipeline worker thread. Serving endpoints
+# enforce their own concurrency/QPS limits — queueing here converts what
+# would be a 429 storm into orderly waiting. Tune via MODEL_MAX_CONCURRENT.
+_MODEL_SEMAPHORE = threading.Semaphore(
+    max(1, int(__import__("os").environ.get("MODEL_MAX_CONCURRENT", "4")))
+)
 
 
 class DatabricksModelClient:
@@ -118,28 +129,41 @@ class DatabricksModelClient:
             "Content-Type":  "application/json",
         }
 
-        for attempt in range(3):
+        # With the pipeline loop parallelised, N workers can hit the model
+        # endpoint simultaneously and trigger a 429 storm where every
+        # thread's retries collide and all give up together. Two defences:
+        #   1. a process-wide semaphore caps concurrent model calls
+        #      (news fetching stays fully parallel; only LLM calls queue);
+        #   2. more attempts with jittered exponential backoff, so retries
+        #      from different threads spread out instead of re-colliding.
+        attempts = 6
+        for attempt in range(attempts):
             try:
-                r = requests.post(
-                    self.url,
-                    headers = headers,
-                    json    = payload,
-                    timeout = self.timeout_sec,
-                )
+                with _MODEL_SEMAPHORE:
+                    r = requests.post(
+                        self.url,
+                        headers = headers,
+                        json    = payload,
+                        timeout = self.timeout_sec,
+                    )
 
                 if r.status_code == 200:
                     return r.json()["choices"][0]["message"]["content"]
 
                 if r.status_code == 429:
-                    # Rate limited — back off and retry
-                    wait = int(r.headers.get("Retry-After", 5 * (attempt + 1)))
-                    wait = min(wait, 30)
-                    print(f"    [DATABRICKS RATE LIMIT] waiting {wait}s (attempt {attempt+1})")
+                    retry_after = r.headers.get("Retry-After")
+                    if retry_after:
+                        wait = min(int(retry_after), 60)
+                    else:
+                        wait = min(3 * (2 ** attempt), 60)
+                    wait += random.uniform(0, 2)          # jitter — de-sync threads
+                    print(f"    [DATABRICKS RATE LIMIT] waiting {wait:.0f}s "
+                          f"(attempt {attempt+1}/{attempts})")
                     time.sleep(wait)
                     continue
 
                 if r.status_code in (500, 502, 503, 504):
-                    time.sleep(3 * (attempt + 1))
+                    time.sleep(min(3 * (2 ** attempt), 45) + random.uniform(0, 2))
                     continue
 
                 # Non-retryable error
@@ -147,7 +171,7 @@ class DatabricksModelClient:
 
             except requests.Timeout:
                 print(f"    [DATABRICKS TIMEOUT] attempt {attempt+1} — endpoint: {self.endpoint}")
-                time.sleep(2)
+                time.sleep(2 + random.uniform(0, 2))
             except requests.RequestException as e:
                 raise ConnectionError(
                     f"Databricks API call failed: {e}\n"
@@ -156,7 +180,7 @@ class DatabricksModelClient:
                 ) from e
 
         raise ConnectionError(
-            f"Databricks API failed after 3 attempts.\n"
+            f"Databricks API failed after {attempts} attempts.\n"
             f"  Endpoint: {self.endpoint}\n"
             f"  Check your workspace URL and token."
         )

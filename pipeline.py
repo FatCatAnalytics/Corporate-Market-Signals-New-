@@ -401,7 +401,12 @@ def run_pipeline(
             idx = completed[0]
             prescreen_log.append(ps_entry)
             done_raw[company] = asdict(result)
-            _save_checkpoint(output_xlsx, done_raw)
+            # Errored companies stay OUT of the checkpoint file so a
+            # resumed run retries them instead of skipping them as done.
+            _save_checkpoint(output_xlsx, {
+                k: v for k, v in done_raw.items()
+                if not str(v.get("summary", "")).startswith("[ERROR")
+            })
             print("\n".join([f"  [{idx:3d}/{total_remaining}] {company}"] + out))
 
     if max_workers == 1 or len(remaining) <= 1:
