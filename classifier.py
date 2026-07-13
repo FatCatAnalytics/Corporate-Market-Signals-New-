@@ -60,6 +60,35 @@ class SignalResult:
         ])
 
 
+# Deal language that identifies an M&A event regardless of which bucket the
+# model put it in. Deliberately specific phrases — bare "acquisition" alone
+# could appear in unrelated commentary.
+_DEAL_RE = re.compile(
+    r"\b(agreement to acquire|to acquire|acquires|acquired by|acquisition of|"
+    r"merger with|merged with|merged into|takeover of|takeover by|"
+    r"spin[- ]?off|spun off|divestiture|divested|divesting)\b",
+    re.IGNORECASE,
+)
+
+
+def _reroute_missorted_deals(res: SignalResult) -> SignalResult:
+    """
+    Deterministic guardrail behind the prompt rules: if the model confirmed
+    an 'operational change' whose own detail text describes a deal, the
+    event is an ma_spinoff — move it. LLM routing instructions reduce this
+    error but do not eliminate it (observed: 'definitive agreement to
+    acquire …' confirmed under operational_change).
+    """
+    if (res.operational_change and not res.ma_spinoff
+            and res.ops_detail and _DEAL_RE.search(res.ops_detail)):
+        res.ma_spinoff         = True
+        res.ma_detail          = res.ops_detail
+        res.operational_change = False
+        res.ops_detail         = ""
+        res.recount()
+    return res
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # llama-server HTTP backend
 # ─────────────────────────────────────────────────────────────────────────────
@@ -219,6 +248,10 @@ Respond with JSON only:
 }}
 Rules:
 - confirmed=false if evidence is weak, ambiguous, or outside the time window
+- A dated news headline from a named source that identifies the parties and
+  the event IS sufficient evidence (confidence 3) — full article text is not
+  required. Registry facts ([GLEIF REGISTRY]/[SEC REGISTRY] lines) are
+  authoritative legal records: treat them as strong evidence (confidence 4+).
 - ma_spinoff: confirm whether the company is the ACQUIRER or the TARGET —
   both count; say which in the detail, plus deal status (announced/pending/completed)
 - operational_change: confirm ONLY named restructuring programmes, significant
@@ -472,6 +505,8 @@ class Classifier:
             result = self._three_pass(company, context)
         else:
             result = self._single_pass(company, context)
+
+        result = _reroute_missorted_deals(result)
 
         if sources:
             result.sources = list(sources)
