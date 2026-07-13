@@ -158,7 +158,17 @@ def load_companies(csv_path: str) -> List[Tuple[str, str, str, str]]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _checkpoint_path(output_xlsx: str) -> str:
+    """
+    Checkpoint lives next to the output file — unless CHECKPOINT_DIR is
+    set, which relocates it. On Databricks serverless the output is
+    written to /tmp (Volume FUSE can't seek for xlsx), but /tmp dies with
+    the cluster; point CHECKPOINT_DIR at a UC Volume so resume survives
+    cluster restarts. Plain JSON appends fine over FUSE.
+    """
     base = os.path.splitext(output_xlsx)[0]
+    ck_dir = os.environ.get("CHECKPOINT_DIR", "").strip()
+    if ck_dir:
+        return os.path.join(ck_dir, os.path.basename(base) + "_checkpoint.json")
     return base + "_checkpoint.json"
 
 
