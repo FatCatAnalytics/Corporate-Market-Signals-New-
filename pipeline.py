@@ -378,6 +378,7 @@ def run_pipeline(
             # from data before buying credits.
             "fulltext_chars": "",
             "thin_evidence":  "",
+            "tavily_chars":   "",
         }
 
         if ps.passed:
@@ -431,6 +432,7 @@ def run_pipeline(
                             source_breakdown = {**fetch.source_breakdown,
                                                 "tavily_raw": len(tav_ctx)},
                         )
+                        ps_entry["tavily_chars"] = len(tav_ctx)
                         out.append(f"          → Tavily (thin evidence): +{len(tav_ctx):,} chars, "
                                    f"{used} credit(s), {tavily_budget.remaining} left")
                     else:
@@ -543,7 +545,7 @@ def run_pipeline(
         log_path = os.path.splitext(output_xlsx)[0] + "_prescreen_log.csv"
         with open(log_path, "w", newline="", encoding="utf-8") as fh:
             writer = csv.DictWriter(fh, fieldnames=["company","passed","stage","score","reason",
-                                                    "fulltext_chars","thin_evidence"])
+                                                    "fulltext_chars","thin_evidence","tavily_chars"])
             writer.writeheader()
             writer.writerows(prescreen_log)
         triggered  = sum(1 for r in prescreen_log if r["passed"])
